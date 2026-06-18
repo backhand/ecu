@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Spec / working drafts — reference material, not deliverables (see README).
+# Leading slash: only the repo-root references/, NOT skill/*/references/.
+/references/
+
+# Go build output
+/ecu
+/dist/
+*.test
+*.out
+
+# Local control-plane state / secrets — never commit
+*.db
+*.sqlite
+*.sqlite3
+*.env
+.env
+ecu.config
+ecu.config.*
+/secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
