@@ -50,6 +50,14 @@ const (
 	// runs on the instance, distinct from the pre-baked snapshot NAME (Image /
 	// ECU_IMAGE). It is what a bake pulls and what a session runs.
 	defaultContainerImage = "ghcr.io/backhand/ecu-image:latest"
+	// defaultAgentBinaryURL is where a freshly provisioned instance fetches the
+	// `ecu` binary from (ECU_AGENT_BINARY_URL) when nothing overrides it. It
+	// points at the published "latest" release asset so the control plane
+	// provisions out of the box without an operator having to set this. Because
+	// it is DEFAULTED it is never in the required set; cloud-init always has a
+	// value to curl. Operators can still override via env, file, or the wizard
+	// (e.g. to pin a version or self-host the binary).
+	defaultAgentBinaryURL = "https://github.com/backhand/ecu/releases/latest/download/ecu-linux-amd64"
 	// defaultBakeTimeout bounds how long the C7 pre-bake waits for the bake
 	// instance to finish pulling the (multi-GB) container image and call back
 	// before tearing the bake instance down. Generous on purpose — a cold pull
@@ -367,7 +375,7 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	c.Image = pick(env["ECU_IMAGE"], fileCfg.Image)
 	c.ContainerImage = pick(env["ECU_CONTAINER_IMAGE"], fileCfg.ContainerImage, defaultContainerImage)
 	c.BaseImage = pick(env["ECU_BASE_IMAGE"], fileCfg.BaseImage, defaultBaseImage)
-	c.AgentBinaryURL = pick(env["ECU_AGENT_BINARY_URL"], fileCfg.AgentBinaryURL)
+	c.AgentBinaryURL = pick(env["ECU_AGENT_BINARY_URL"], fileCfg.AgentBinaryURL, defaultAgentBinaryURL)
 	c.DevToolServer = pick(env["ECU_DEV_TOOLSERVER"], fileCfg.DevToolServer)
 
 	// Integer settings. MaxSessions defaults to defaultMaxSessions when neither
@@ -498,18 +506,24 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 }
 
 // requiredFor returns the effective required-key set: the supplied base set
-// plus any keys implied by the merged config. The only context-dependent
-// requirement today is the provider token: a production deployment (no
-// ECU_DEV_TOOLSERVER) using the hetzner provider must supply ECU_HCLOUD_TOKEN.
-// The dev-toolserver path provisions nothing, so it stays at the base set; a
-// non-hetzner provider has no token requirement here. The base set is never
-// dropped, so a caller asserting "only ECU_API_KEY is required" in dev mode
-// still holds.
+// plus any keys implied by the merged config. The context-dependent
+// requirements are the provider-provisioning settings: a production deployment
+// (no ECU_DEV_TOOLSERVER) using the hetzner provider must supply
+// ECU_HCLOUD_TOKEN, ECU_INSTANCE_TYPE, and ECU_REGION — without all three,
+// provisioning fails per-session at POST /sessions (a missing ServerType /
+// location), so we require them up front and fail fast (or prompt) instead.
+// They have no built-in default because availability varies per account and
+// region. The dev-toolserver path provisions nothing, so it stays at the base
+// set; a non-hetzner provider has no provisioning requirement here. The base
+// set is never dropped, so a caller asserting "only ECU_API_KEY is required" in
+// dev mode still holds.
 func requiredFor(c *Config, base []string) []string {
 	out := append([]string(nil), base...)
 	if c.DevToolServer == "" && strings.EqualFold(c.Provider, "hetzner") {
-		if !contains(out, "ECU_HCLOUD_TOKEN") {
-			out = append(out, "ECU_HCLOUD_TOKEN")
+		for _, k := range []string{"ECU_HCLOUD_TOKEN", "ECU_INSTANCE_TYPE", "ECU_REGION"} {
+			if !contains(out, k) {
+				out = append(out, k)
+			}
 		}
 	}
 	return out
@@ -549,6 +563,10 @@ func valueForKey(c *Config, key string) string {
 		return c.Hostname
 	case "ECU_HCLOUD_TOKEN":
 		return c.HCloudToken
+	case "ECU_INSTANCE_TYPE":
+		return c.InstanceType
+	case "ECU_REGION":
+		return c.Region
 	case "ECU_PROVIDER":
 		return c.Provider
 	default:

@@ -9,11 +9,12 @@ import (
 // TestTLSConfigDefaultsOff verifies the C10 TLS knobs default safely: ECU_TLS
 // defaults to "off" (plain HTTP, the dev/Ingress-fronted default) and
 // ECU_TLS_CACHE_DIR defaults to the home-relative autocert cache, with the
-// leading ~ expanded. ECU_API_KEY + ECU_HCLOUD_TOKEN are set so the production
-// (hetzner) path does not fail-fast — we are exercising defaults, not the
-// required-key decision.
+// leading ~ expanded. The full production (hetzner) required set —
+// ECU_API_KEY + ECU_HCLOUD_TOKEN + ECU_INSTANCE_TYPE + ECU_REGION — is set so
+// the path does not fail-fast; we are exercising defaults, not the required-key
+// decision.
 func TestTLSConfigDefaultsOff(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok"}
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok", "ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1"}
 
 	cfg, _, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
 	if err != nil {
@@ -43,6 +44,8 @@ func TestTLSConfigEnvOverride(t *testing.T) {
 	env := map[string]string{
 		"ECU_API_KEY":       "k",
 		"ECU_HCLOUD_TOKEN":  "hc_tok",
+		"ECU_INSTANCE_TYPE": "cpx32",
+		"ECU_REGION":        "nbg1",
 		"ECU_TLS":           "auto",
 		"ECU_TLS_CACHE_DIR": "/var/lib/ecu/tls",
 	}
@@ -83,10 +86,10 @@ func TestTLSConfigPrecedenceEnvOverFile(t *testing.T) {
 // TestResolveEnvPresent verifies that when the required keys are present in the
 // environment, resolve returns runWizard=false, no error, and the key is in the
 // resolved config. The default provider is hetzner and no dev tool-server is
-// set, so production rules apply: ECU_HCLOUD_TOKEN is required alongside
-// ECU_API_KEY.
+// set, so production rules apply: ECU_HCLOUD_TOKEN, ECU_INSTANCE_TYPE, and
+// ECU_REGION are required alongside ECU_API_KEY.
 func TestResolveEnvPresent(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k_live_123", "ECU_HCLOUD_TOKEN": "hc_tok"}
+	env := map[string]string{"ECU_API_KEY": "k_live_123", "ECU_HCLOUD_TOKEN": "hc_tok", "ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1"}
 
 	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
 	if err != nil {
@@ -121,7 +124,9 @@ func TestResolveDevToolServerOnlyNeedsAPIKey(t *testing.T) {
 // requirement: production (no dev tool-server) on the hetzner provider requires
 // ECU_HCLOUD_TOKEN, and its absence fails fast with no TTY, naming the key.
 func TestResolveProductionRequiresHCloudToken(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k"} // hetzner default, no dev seam, no token
+	// Supply type + region so the ONLY missing key is the token; this isolates
+	// the assertion that the token specifically is named.
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1"}
 
 	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
 	if err == nil {
@@ -132,6 +137,132 @@ func TestResolveProductionRequiresHCloudToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ECU_HCLOUD_TOKEN") {
 		t.Fatalf("error %q does not name the missing key ECU_HCLOUD_TOKEN", err.Error())
+	}
+}
+
+// TestResolveAgentBinaryURLDefaults verifies ECU_AGENT_BINARY_URL is DEFAULTED
+// (never required): when unset it resolves to the published release asset, so
+// cloud-init always has a binary to fetch and provisioning never fails on a
+// missing agent URL out of the box. It also must NOT appear in the required set
+// — a production-hetzner deploy that omits it still resolves headless.
+func TestResolveAgentBinaryURLDefaults(t *testing.T) {
+	// Full production-hetzner required set, but deliberately NO
+	// ECU_AGENT_BINARY_URL.
+	env := map[string]string{
+		"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok",
+		"ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1",
+	}
+	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (agent_binary_url must be defaulted, not required)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false: a missing agent_binary_url must not force the wizard")
+	}
+	if cfg.AgentBinaryURL != defaultAgentBinaryURL {
+		t.Fatalf("cfg.AgentBinaryURL = %q, want default %q", cfg.AgentBinaryURL, defaultAgentBinaryURL)
+	}
+
+	// Env overrides the default.
+	env["ECU_AGENT_BINARY_URL"] = "https://example.com/ecu-custom"
+	cfg, _, err = resolve(env, nil, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v", err)
+	}
+	if cfg.AgentBinaryURL != "https://example.com/ecu-custom" {
+		t.Fatalf("cfg.AgentBinaryURL = %q, want the env override", cfg.AgentBinaryURL)
+	}
+
+	// File overrides the default (and env, absent, does not).
+	cfg, _, err = resolve(
+		map[string]string{
+			"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok",
+			"ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1",
+		},
+		&Config{AgentBinaryURL: "https://files/from-file"}, false, requiredKeys,
+	)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v", err)
+	}
+	if cfg.AgentBinaryURL != "https://files/from-file" {
+		t.Fatalf("cfg.AgentBinaryURL = %q, want the file value (file beats default)", cfg.AgentBinaryURL)
+	}
+}
+
+// TestResolveProductionRequiresInstanceTypeAndRegion verifies the new
+// context-dependent requirement: production (no dev tool-server) on the hetzner
+// provider requires ECU_INSTANCE_TYPE and ECU_REGION, and their absence
+// fails fast with no TTY, naming BOTH missing keys (so a headless deploy gets a
+// clear startup error instead of failing per-session at provision time).
+func TestResolveProductionRequiresInstanceTypeAndRegion(t *testing.T) {
+	// Token present so the only missing keys are type + region.
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok"}
+
+	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err == nil {
+		t.Fatalf("resolve returned nil error, want fail-fast for missing ECU_INSTANCE_TYPE/ECU_REGION")
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false on the fail-fast path")
+	}
+	if !strings.Contains(err.Error(), "ECU_INSTANCE_TYPE") {
+		t.Fatalf("error %q does not name the missing key ECU_INSTANCE_TYPE", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ECU_REGION") {
+		t.Fatalf("error %q does not name the missing key ECU_REGION", err.Error())
+	}
+
+	// With all four production keys present, it resolves headless.
+	full := map[string]string{
+		"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok",
+		"ECU_INSTANCE_TYPE": "cpx32", "ECU_REGION": "nbg1",
+	}
+	cfg, runWizard, err := resolve(full, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error with full production config: %v", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false when all required keys are set")
+	}
+	if cfg.InstanceType != "cpx32" || cfg.Region != "nbg1" {
+		t.Fatalf("cfg.InstanceType=%q cfg.Region=%q, want cpx32/nbg1", cfg.InstanceType, cfg.Region)
+	}
+}
+
+// TestResolveDevToolServerDoesNotRequireTypeOrRegion verifies that the
+// dev-toolserver path (which provisions nothing) does NOT require
+// ECU_INSTANCE_TYPE or ECU_REGION even on the default hetzner provider: only
+// ECU_API_KEY is needed, and resolve succeeds headless with neither set.
+func TestResolveDevToolServerDoesNotRequireTypeOrRegion(t *testing.T) {
+	env := map[string]string{
+		"ECU_API_KEY":        "k",
+		"ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+		// deliberately no ECU_INSTANCE_TYPE / ECU_REGION
+	}
+	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (dev-toolserver mode must not require type/region)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false: dev mode needs only ECU_API_KEY")
+	}
+	if cfg.InstanceType != "" || cfg.Region != "" {
+		t.Fatalf("expected type/region unset in dev mode, got %q/%q", cfg.InstanceType, cfg.Region)
+	}
+}
+
+// TestResolveNonHetznerDoesNotRequireTypeOrRegion verifies the type/region
+// requirement is specific to the hetzner provider: a non-hetzner provider
+// resolves headless without them (it has no hetzner-shaped ServerType/location
+// requirement).
+func TestResolveNonHetznerDoesNotRequireTypeOrRegion(t *testing.T) {
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_PROVIDER": "someother"}
+	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (non-hetzner provider must not require type/region)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false")
 	}
 }
 

@@ -2,9 +2,11 @@ package config
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,11 +282,15 @@ func configToFileConfig(cfg *Config) *fileConfig {
 // in tests, though Load wires os.Stdin.
 //
 // The base required key is ECU_API_KEY; a production deployment on the hetzner
-// provider additionally requires ECU_HCLOUD_TOKEN, so the wizard augments the
+// provider additionally requires ECU_HCLOUD_TOKEN plus the provisioning
+// settings ECU_INSTANCE_TYPE and ECU_REGION (a server type and a location, both
+// account/region-specific with no safe default). The wizard augments the
 // passed-in base set with requiredFor (the same context-dependent computation
-// resolve uses) and prompts for the token when it is required and missing. We
-// additionally offer to capture the public hostname since it is harmless and
-// convenient, but never require it.
+// resolve uses) and prompts for each required-and-missing value. After
+// collecting the Hetzner token, type, and region it best-effort validates the
+// type×region combo against the Hetzner API and warns (non-fatally) if the type
+// is not available in that location. We additionally offer to capture the
+// public hostname since it is harmless and convenient, but never require it.
 func runWizardInto(cfg *Config, in io.Reader, out io.Writer, required []string) error {
 	scanner := bufio.NewScanner(in)
 	fmt.Fprintln(out, "ECU control plane — initial setup")
@@ -319,6 +325,34 @@ func runWizardInto(cfg *Config, in io.Reader, out io.Writer, required []string) 
 		cfg.HCloudToken = val
 	}
 
+	// Hetzner server type and location (required in production on hetzner). They
+	// have no default — availability varies per account and region — so a
+	// headless deploy must supply them; here we prompt. The example values are
+	// real Hetzner identifiers to anchor the operator.
+	if requiredSet["ECU_INSTANCE_TYPE"] && cfg.InstanceType == "" {
+		val, err := promptRequired(scanner, out, "Hetzner server type (e.g. cpx32 — 4 vCPU/8 GB) (ECU_INSTANCE_TYPE)")
+		if err != nil {
+			return err
+		}
+		cfg.InstanceType = val
+	}
+	if requiredSet["ECU_REGION"] && cfg.Region == "" {
+		val, err := promptRequired(scanner, out, "Hetzner region/location (e.g. nbg1, hel1, fsn1, ash) (ECU_REGION)")
+		if err != nil {
+			return err
+		}
+		cfg.Region = val
+	}
+
+	// Optional, best-effort validation: if we now hold a token + type + region,
+	// check the type is actually offered in that location and warn if not. This
+	// is non-fatal on purpose — the network may be down at wizard time, and the
+	// operator may be configuring ahead of stock arriving — so any error here is
+	// only surfaced as a hint, never aborts setup.
+	if cfg.HCloudToken != "" && cfg.InstanceType != "" && cfg.Region != "" {
+		warnIfHetznerComboUnavailable(out, cfg.HCloudToken, cfg.InstanceType, cfg.Region)
+	}
+
 	// Public hostname (optional, prompted for convenience).
 	if cfg.Hostname == "" {
 		val, err := promptOptional(scanner, out, "Public hostname for TLS (ECU_HOSTNAME, optional)")
@@ -331,6 +365,99 @@ func runWizardInto(cfg *Config, in io.Reader, out io.Writer, required []string) 
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Setup complete; configuration will be saved.")
 	return nil
+}
+
+// hetznerValidateTimeout bounds the optional wizard-time Hetzner availability
+// check so a slow or unreachable API never stalls setup.
+const hetznerValidateTimeout = 5 * time.Second
+
+// hetznerDatacentersURL is the Hetzner Cloud API endpoint the optional wizard
+// validation queries. It is a package var (not a const) solely so tests can
+// point it at an httptest server; production never changes it.
+var hetznerDatacentersURL = "https://api.hetzner.cloud/v1/datacenters"
+
+// warnIfHetznerComboUnavailable best-effort checks, via the public Hetzner
+// Cloud API, that serverType is offered in the datacenter(s) of the given
+// location, printing a warning to out if it is provably not. It is deliberately
+// forgiving: ANY error (network down, auth rejected, unexpected shape) is
+// swallowed silently because the wizard may run offline or ahead of stock, and
+// this check must never block or fail setup. It only warns on a positive
+// "type is not in this location's available set" signal.
+//
+// The /v1/datacenters response lists, per datacenter, the server types
+// available there. A Hetzner "location" (e.g. nbg1) can contain several
+// datacenters (nbg1-dc3, …); the type is considered available in the location
+// if ANY datacenter in it offers it.
+func warnIfHetznerComboUnavailable(out io.Writer, token, serverType, region string) {
+	ctx, cancel := context.WithTimeout(context.Background(), hetznerValidateTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hetznerDatacentersURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return // network down / unreachable: stay silent, this is optional.
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return // auth rejected or API hiccup: don't second-guess the operator.
+	}
+
+	var payload struct {
+		Datacenters []struct {
+			Location struct {
+				Name string `json:"name"`
+			} `json:"location"`
+			ServerTypes struct {
+				Available []int `json:"available"`
+			} `json:"server_types"`
+		} `json:"datacenters"`
+		ServerTypes []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"server_types"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return
+	}
+
+	// The datacenters endpoint reports available server types by numeric ID, and
+	// also embeds the server-type catalog so we can map our NAME (e.g. cpx32) to
+	// its ID. If we can't resolve the name to an ID, we can't make a confident
+	// claim — stay silent.
+	typeID := 0
+	for _, st := range payload.ServerTypes {
+		if strings.EqualFold(st.Name, serverType) {
+			typeID = st.ID
+			break
+		}
+	}
+	if typeID == 0 {
+		return
+	}
+
+	sawLocation := false
+	for _, dc := range payload.Datacenters {
+		if !strings.EqualFold(dc.Location.Name, region) {
+			continue
+		}
+		sawLocation = true
+		for _, id := range dc.ServerTypes.Available {
+			if id == typeID {
+				return // available here — nothing to warn about.
+			}
+		}
+	}
+	if !sawLocation {
+		// We couldn't confirm the region exists in the catalog; don't warn (the
+		// operator may know better than our snapshot).
+		return
+	}
+	fmt.Fprintf(out, "  (warning: Hetzner server type %q does not appear to be available in location %q right now; provisioning there may fail — double-check, or change ECU_INSTANCE_TYPE/ECU_REGION)\n", serverType, region)
 }
 
 // promptRequired prints prompt and reads a non-empty trimmed line, re-prompting
