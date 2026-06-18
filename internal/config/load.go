@@ -170,6 +170,13 @@ func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 		}
 		c.MaxLifetime = d
 	}
+	if fc.ReapInterval != "" {
+		d, err := time.ParseDuration(fc.ReapInterval)
+		if err != nil {
+			return nil, fmt.Errorf("config file reap_interval: invalid duration %q: %w", fc.ReapInterval, err)
+		}
+		c.ReapInterval = d
+	}
 	return c, nil
 }
 
@@ -218,6 +225,9 @@ func configToFileConfig(cfg *Config) *fileConfig {
 	}
 	if cfg.MaxLifetime != 0 {
 		fc.MaxLifetime = cfg.MaxLifetime.String()
+	}
+	if cfg.ReapInterval != 0 {
+		fc.ReapInterval = cfg.ReapInterval.String()
 	}
 	if cfg.ProvisionTimeout != 0 {
 		fc.ProvisionTimeout = cfg.ProvisionTimeout.String()

@@ -35,6 +35,16 @@ const (
 	// defaultBaseImage is the cold-boot base OS image used when no pre-baked
 	// image is configured.
 	defaultBaseImage = "ubuntu-24.04"
+	// C5 reaper / cap defaults. They apply when neither env nor file supplies a
+	// value. defaultMaxSessions is the global active-session cap; explicitly
+	// setting ECU_MAX_SESSIONS=0 disables it (unlimited). defaultIdleTimeout and
+	// defaultMaxLifetime bound an idle and a maximally-old session respectively;
+	// defaultReapInterval is the base sweep cadence (clamped down to the
+	// smallest positive timeout by the reaper).
+	defaultMaxSessions  = 10
+	defaultIdleTimeout  = 15 * time.Minute
+	defaultMaxLifetime  = 8 * time.Hour
+	defaultReapInterval = 1 * time.Minute
 )
 
 // Config holds every ECU_* setting the control plane understands. All fields
@@ -90,17 +100,26 @@ type Config struct {
 	// (ECU_PROVISION_TIMEOUT). Defaults to defaultProvisionTimeout.
 	ProvisionTimeout time.Duration
 
-	// MaxSessions is the global session cap (ECU_MAX_SESSIONS). Stored now,
-	// enforced by the reaper/caps component (C5).
+	// MaxSessions is the global cap on concurrently ACTIVE
+	// (provisioning+ready) sessions (ECU_MAX_SESSIONS), enforced by POST
+	// /sessions (C5). Defaults to defaultMaxSessions. Explicitly setting
+	// ECU_MAX_SESSIONS=0 DISABLES the cap (unlimited).
 	MaxSessions int
 
 	// IdleTimeout is the inactivity timeout before a session is reaped
-	// (ECU_IDLE_TIMEOUT). Stored now, enforced by C5.
+	// (ECU_IDLE_TIMEOUT). Defaults to defaultIdleTimeout; 0 disables idle
+	// reaping. Enforced by C5.
 	IdleTimeout time.Duration
 
 	// MaxLifetime is the hard ceiling on session lifetime regardless of
-	// activity (ECU_MAX_LIFETIME). Stored now, enforced by C5.
+	// activity (ECU_MAX_LIFETIME). Defaults to defaultMaxLifetime; 0 disables
+	// lifetime reaping. Enforced by C5.
 	MaxLifetime time.Duration
+
+	// ReapInterval is the base cadence of the C5 reaper's sweep
+	// (ECU_REAP_INTERVAL). Defaults to defaultReapInterval. The reaper clamps it
+	// down so it never exceeds the smallest positive idle/lifetime timeout.
+	ReapInterval time.Duration
 
 	// MaxPersistentSessions caps concurrent persistent sessions
 	// (ECU_MAX_PERSISTENT_SESSIONS). Defaults to defaultMaxPersistentSessions.
@@ -145,6 +164,7 @@ type fileConfig struct {
 	MaxSessions           int    `json:"max_sessions,omitempty"`
 	IdleTimeout           string `json:"idle_timeout,omitempty"`
 	MaxLifetime           string `json:"max_lifetime,omitempty"`
+	ReapInterval          string `json:"reap_interval,omitempty"`
 	MaxPersistentSessions int    `json:"max_persistent_sessions,omitempty"`
 	DBPath                string `json:"db_path,omitempty"`
 	DevToolServer         string `json:"dev_tool_server,omitempty"`
@@ -257,9 +277,12 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	c.AgentBinaryURL = pick(env["ECU_AGENT_BINARY_URL"], fileCfg.AgentBinaryURL)
 	c.DevToolServer = pick(env["ECU_DEV_TOOLSERVER"], fileCfg.DevToolServer)
 
-	// Integer settings.
+	// Integer settings. MaxSessions defaults to defaultMaxSessions when neither
+	// env nor file supplies it; an explicit ECU_MAX_SESSIONS=0 is honored as
+	// "unlimited" (parseIntSetting returns the parsed env value, so 0 means 0
+	// here, which the cap treats as no limit).
 	if c.MaxSessions, err = parseIntSetting(
-		"ECU_MAX_SESSIONS", env["ECU_MAX_SESSIONS"], fileCfg.MaxSessions, fileCfg.MaxSessions != 0, 0,
+		"ECU_MAX_SESSIONS", env["ECU_MAX_SESSIONS"], fileCfg.MaxSessions, fileCfg.MaxSessions != 0, defaultMaxSessions,
 	); err != nil {
 		return nil, false, err
 	}
@@ -272,17 +295,23 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 
 	// Duration settings. File values come in as already-parsed durations, so
 	// stringify them for the shared parser.
-	var fileIdle, fileMaxLife string
+	var fileIdle, fileMaxLife, fileReapInterval string
 	if fileCfg.IdleTimeout != 0 {
 		fileIdle = fileCfg.IdleTimeout.String()
 	}
 	if fileCfg.MaxLifetime != 0 {
 		fileMaxLife = fileCfg.MaxLifetime.String()
 	}
+	if fileCfg.ReapInterval != 0 {
+		fileReapInterval = fileCfg.ReapInterval.String()
+	}
 	if c.IdleTimeout, err = parseDurationSetting("ECU_IDLE_TIMEOUT", env["ECU_IDLE_TIMEOUT"], fileIdle); err != nil {
 		return nil, false, err
 	}
 	if c.MaxLifetime, err = parseDurationSetting("ECU_MAX_LIFETIME", env["ECU_MAX_LIFETIME"], fileMaxLife); err != nil {
+		return nil, false, err
+	}
+	if c.ReapInterval, err = parseDurationSetting("ECU_REAP_INTERVAL", env["ECU_REAP_INTERVAL"], fileReapInterval); err != nil {
 		return nil, false, err
 	}
 	var fileProvTimeout string
@@ -291,6 +320,21 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	}
 	if c.ProvisionTimeout, err = parseDurationSetting("ECU_PROVISION_TIMEOUT", env["ECU_PROVISION_TIMEOUT"], fileProvTimeout); err != nil {
 		return nil, false, err
+	}
+
+	// Apply duration defaults where unset (zero). A zero IdleTimeout/MaxLifetime
+	// would DISABLE those reaper rules; operators expect the documented defaults
+	// unless they deliberately override, so we fill them here. (To truly disable
+	// a rule, an operator must set it elsewhere in code, not via config — the
+	// product wants a default idle/lifetime ceiling.)
+	if c.IdleTimeout == 0 {
+		c.IdleTimeout = defaultIdleTimeout
+	}
+	if c.MaxLifetime == 0 {
+		c.MaxLifetime = defaultMaxLifetime
+	}
+	if c.ReapInterval == 0 {
+		c.ReapInterval = defaultReapInterval
 	}
 	if c.ProvisionTimeout == 0 {
 		c.ProvisionTimeout = defaultProvisionTimeout

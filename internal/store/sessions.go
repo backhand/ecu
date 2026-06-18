@@ -31,6 +31,15 @@ type Session struct {
 	// (no real instance) and for sessions created before the instance_id
 	// migration. DELETE uses it to destroy the instance via the Provider.
 	InstanceID string
+
+	// TunnelLostAt is the instant the session's LIVE reverse tunnel was last
+	// lost (the broker stamps it when an established tunnel closes; it is
+	// cleared when an agent (re)connects). The zero value means "never lost /
+	// currently connected" and is stored as the empty string. The C5 reaper
+	// uses max(CreatedAt, TunnelLostAt) as the start of the orphan/reconnect
+	// window so a session that briefly loses its tunnel gets a fresh grace
+	// period rather than being measured from its original creation.
+	TunnelLostAt time.Time
 }
 
 // CreateSession inserts a new session row. created_at and last_activity_at are
@@ -41,14 +50,17 @@ func (s *Store) CreateSession(sess *Session) error {
 	now := time.Now().UTC()
 	sess.CreatedAt = now
 	sess.LastActivityAt = now
+	// A freshly-created session has a live (or imminent) tunnel, so tunnel_lost_at
+	// starts empty (never lost). It is stamped only when an established tunnel
+	// later closes.
 	const q = `
 INSERT INTO sessions
-    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	_, err := s.db.Exec(q,
 		sess.ID, sess.Account, sess.Status, sess.ToolEndpoint, boolToInt(sess.Persistent),
 		sess.Width, sess.Height,
-		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken, sess.InstanceID,
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken, sess.InstanceID, "",
 	)
 	if err != nil {
 		return fmt.Errorf("store: creating session: %w", err)
@@ -56,34 +68,65 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	return nil
 }
 
+// sessionColumns is the canonical column list (and order) shared by every
+// session SELECT so the scan targets in scanSession stay in lockstep with the
+// queries. Keep this in sync with the CreateSession INSERT column list.
+const sessionColumns = `id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at`
+
+// scanSession scans one sessions row (selected via sessionColumns, in that
+// order) into a Session, decoding the 0/1 persistent flag and parsing the
+// timestamp columns. created_at/last_activity_at are always present
+// (NOT NULL, set on insert); tunnel_lost_at is optional and decodes the empty
+// string to the zero time. The src is a *sql.Row or *sql.Rows (anything with
+// Scan); callers handle ErrNoRows / iteration themselves.
+func scanSession(src interface{ Scan(...any) error }) (Session, error) {
+	var (
+		out                                 Session
+		persistentInt                       int
+		createdAtStr, lastActStr, lostAtStr string
+	)
+	if err := src.Scan(
+		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
+		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID, &lostAtStr,
+	); err != nil {
+		return Session{}, err
+	}
+	out.Persistent = persistentInt != 0
+	var err error
+	if out.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAtStr); err != nil {
+		return Session{}, fmt.Errorf("store: parsing created_at: %w", err)
+	}
+	if out.LastActivityAt, err = time.Parse(time.RFC3339Nano, lastActStr); err != nil {
+		return Session{}, fmt.Errorf("store: parsing last_activity_at: %w", err)
+	}
+	if out.TunnelLostAt, err = parseTimestamp(lostAtStr); err != nil {
+		return Session{}, fmt.Errorf("store: parsing tunnel_lost_at: %w", err)
+	}
+	return out, nil
+}
+
+// parseTimestamp parses an RFC3339Nano timestamp column, mapping the empty
+// string to the zero time (no error). It is used for OPTIONAL timestamp columns
+// like tunnel_lost_at whose empty default means "unset", as distinct from the
+// always-present created_at/last_activity_at columns.
+func parseTimestamp(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
+
 // GetSession loads a session by id. found is false when no such row exists;
 // that is not an error (found=false, err=nil), matching the convention used by
 // LookupKey.
 func (s *Store) GetSession(id string) (sess *Session, found bool, err error) {
-	const q = `
-SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id
-FROM sessions WHERE id = ?;`
-	var (
-		out                      Session
-		persistentInt            int
-		createdAtStr, lastActStr string
-	)
-	row := s.db.QueryRow(q, id)
-	switch err := row.Scan(
-		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
-		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID,
-	); {
+	q := `SELECT ` + sessionColumns + ` FROM sessions WHERE id = ?;`
+	out, err := scanSession(s.db.QueryRow(q, id))
+	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil
 	case err != nil:
 		return nil, false, fmt.Errorf("store: getting session: %w", err)
-	}
-	out.Persistent = persistentInt != 0
-	if out.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAtStr); err != nil {
-		return nil, false, fmt.Errorf("store: parsing created_at: %w", err)
-	}
-	if out.LastActivityAt, err = time.Parse(time.RFC3339Nano, lastActStr); err != nil {
-		return nil, false, fmt.Errorf("store: parsing last_activity_at: %w", err)
 	}
 	return &out, true, nil
 }
@@ -136,19 +179,9 @@ func (s *Store) SessionByTunnelToken(token string) (sess *Session, found bool, e
 	if token == "" {
 		return nil, false, nil
 	}
-	const q = `
-SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id
-FROM sessions WHERE tunnel_token = ? LIMIT 1;`
-	var (
-		out                      Session
-		persistentInt            int
-		createdAtStr, lastActStr string
-	)
-	row := s.db.QueryRow(q, token)
-	switch err := row.Scan(
-		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
-		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID,
-	); {
+	q := `SELECT ` + sessionColumns + ` FROM sessions WHERE tunnel_token = ? LIMIT 1;`
+	out, err := scanSession(s.db.QueryRow(q, token))
+	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil
 	case err != nil:
@@ -160,14 +193,84 @@ FROM sessions WHERE tunnel_token = ? LIMIT 1;`
 		subtle.ConstantTimeCompare([]byte(out.TunnelToken), []byte(token)) != 1 {
 		return nil, false, nil
 	}
-	out.Persistent = persistentInt != 0
-	if out.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAtStr); err != nil {
-		return nil, false, fmt.Errorf("store: parsing created_at: %w", err)
-	}
-	if out.LastActivityAt, err = time.Parse(time.RFC3339Nano, lastActStr); err != nil {
-		return nil, false, fmt.Errorf("store: parsing last_activity_at: %w", err)
-	}
 	return &out, true, nil
+}
+
+// SetSessionTunnelLost records (or clears) the instant a session's live tunnel
+// was lost. A non-zero lostAt is stored as RFC3339Nano; a ZERO lostAt
+// (lostAt.IsZero()) clears the column back to the empty string, which the
+// reaper reads as "currently connected / never lost". It is a no-op (no error)
+// for unknown ids — the UPDATE simply matches no row. The broker stamps loss on
+// tunnel close and clears it on (re)connect; the reaper's boot reconcile stamps
+// it for sessions that have no tunnel at startup.
+func (s *Store) SetSessionTunnelLost(id string, lostAt time.Time) error {
+	var val string
+	if !lostAt.IsZero() {
+		val = lostAt.UTC().Format(time.RFC3339Nano)
+	}
+	if _, err := s.db.Exec(`UPDATE sessions SET tunnel_lost_at = ? WHERE id = ?;`, val, id); err != nil {
+		return fmt.Errorf("store: setting session tunnel_lost_at: %w", err)
+	}
+	return nil
+}
+
+// ListNonTerminalSessions returns every session in a non-terminal status
+// (provisioning or ready), fully parsed and ordered by creation time. The
+// terminal statuses (error, terminated) are excluded: they back nothing that
+// could leak (provisioning tore down failed instances; terminated already
+// destroyed theirs), so the reaper need never look at them. This is the
+// reaper's per-sweep input and the basis for the active-session cap.
+func (s *Store) ListNonTerminalSessions() ([]Session, error) {
+	q := `SELECT ` + sessionColumns + `
+FROM sessions WHERE status IN ('provisioning', 'ready') ORDER BY created_at;`
+	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("store: listing non-terminal sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scanning non-terminal session: %w", err)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterating non-terminal sessions: %w", err)
+	}
+	return out, nil
+}
+
+// CountActiveSessions returns the number of sessions in an ACTIVE
+// (provisioning or ready) status. This is the quantity the global session cap
+// (ECU_MAX_SESSIONS) is enforced against: an active session may be holding —
+// or about to hold — a paid instance, whereas error/terminated sessions hold
+// nothing.
+func (s *Store) CountActiveSessions() (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE status IN ('provisioning', 'ready');`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: counting active sessions: %w", err)
+	}
+	return n, nil
+}
+
+// CountActiveSessionsForAccount returns the number of ACTIVE (provisioning or
+// ready) sessions owned by account. It backs a per-account cap; the global cap
+// uses CountActiveSessions.
+func (s *Store) CountActiveSessionsForAccount(account string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE status IN ('provisioning', 'ready') AND account = ?;`,
+		account,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: counting active sessions for account: %w", err)
+	}
+	return n, nil
 }
 
 // boolToInt maps a Go bool to the 0/1 INTEGER convention used in the schema.

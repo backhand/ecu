@@ -66,6 +66,22 @@ type Server struct {
 	// provisionCfg carries everything the production POST /sessions path needs
 	// to render cloud-init and create an instance (see ProvisionConfig).
 	provisionCfg ProvisionConfig
+
+	// reaperCfg carries the C5 reaper timeouts/interval (see ReaperConfig). The
+	// zero value disables the idle/lifetime rules and uses a default interval;
+	// the orphan rule still applies (it is the leak backstop).
+	reaperCfg ReaperConfig
+
+	// maxSessions is the global cap on ACTIVE (provisioning+ready) sessions
+	// enforced by POST /sessions (C5). 0 means unlimited. Set via
+	// WithMaxSessions.
+	maxSessions int
+
+	// now is the clock the reaper reads. It is time.Now in production and is
+	// overridden in tests (WithClock) so idle/lifetime/orphan windows can be
+	// driven deterministically without real sleeping. ONLY the reaper uses it;
+	// the broker and store stamp real wall-clock time.
+	now func() time.Time
 }
 
 // ProvisionConfig carries the settings the production provisioning path needs.
@@ -128,6 +144,30 @@ func WithProvisionConfig(cfg ProvisionConfig) ServerOption {
 	return func(s *Server) { s.provisionCfg = cfg }
 }
 
+// WithReaperConfig supplies the C5 reaper's timeouts and tick interval (see
+// ReaperConfig). Without it the reaper runs with idle/lifetime disabled and a
+// default interval; the orphan rule still protects against leaked instances.
+func WithReaperConfig(cfg ReaperConfig) ServerOption {
+	return func(s *Server) { s.reaperCfg = cfg }
+}
+
+// WithMaxSessions sets the global cap on concurrently ACTIVE
+// (provisioning+ready) sessions enforced by POST /sessions. A value of 0 (the
+// default) means UNLIMITED — no cap is applied. error/terminated sessions never
+// count toward the cap.
+func WithMaxSessions(n int) ServerOption {
+	return func(s *Server) { s.maxSessions = n }
+}
+
+// WithClock overrides the clock the reaper reads (default time.Now). It exists
+// for deterministic tests, which advance a fake clock instead of sleeping. Only
+// the reaper consults this clock; the broker stamps real wall-clock time so the
+// idle/lifetime backstops cannot be skewed by a test clock in production code
+// paths.
+func WithClock(now func() time.Time) ServerOption {
+	return func(s *Server) { s.now = now }
+}
+
 // NewServer builds a Server. The store is used for auth and session records;
 // devToolServer is the ECU_DEV_TOOLSERVER seam (may be empty). The tool proxy's
 // SessionTransport is a composite that PREFERS a live reverse tunnel (C3) and
@@ -142,6 +182,10 @@ func NewServer(st *store.Store, devToolServer string, opts ...ServerOption) *Ser
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Default the reaper clock to wall-clock time unless a test injected one.
+	if s.now == nil {
+		s.now = time.Now
 	}
 	// Composite: tunnel preferred, direct dev endpoint as fallback. When
 	// devToolServer is empty the direct side simply never resolves (ok=false),

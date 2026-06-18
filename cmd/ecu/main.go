@@ -11,12 +11,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/backhand/ecu/internal/agent"
 	"github.com/backhand/ecu/internal/config"
@@ -144,6 +146,19 @@ func runControlPlane() error {
 	opts := []controlplane.ServerOption{
 		controlplane.WithExposeTunnelToken(exposeTunnelToken),
 		controlplane.WithListenAddr(cfg.Listen),
+		// C5: the global active-session cap and the reaper apply in BOTH dev and
+		// production. In dev mode there is no provider, so reaper teardown is a
+		// no-op, but idle/lifetime reaping of dev sessions and the cap are still
+		// correct and desirable, so these go on the base opts (not the prod-only
+		// block below). OrphanGrace mirrors controlplane.defaultOrphanGrace
+		// (unexported, so the literal is repeated here).
+		controlplane.WithMaxSessions(cfg.MaxSessions),
+		controlplane.WithReaperConfig(controlplane.ReaperConfig{
+			IdleTimeout:  cfg.IdleTimeout,
+			MaxLifetime:  cfg.MaxLifetime,
+			ReapInterval: cfg.ReapInterval,
+			OrphanGrace:  2 * time.Minute, // mirrors controlplane.defaultOrphanGrace
+		}),
 	}
 
 	// Production path only: construct the cloud Provider and the provisioning
@@ -189,9 +204,36 @@ func runControlPlane() error {
 		log.Printf("ecu: DEV tunnel-token exposure enabled (ECU_DEV_EXPOSE_TUNNEL_TOKEN=1); POST /sessions returns the tunnel secret — do NOT use in production")
 	}
 
+	// Graceful lifecycle: cancel ctx on SIGINT/SIGTERM, run the reaper and the
+	// HTTP server concurrently, and on shutdown drain in-flight requests with a
+	// bounded timeout. Cancelling ctx stops the reaper loop too.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Plain HTTP on ECU_LISTEN; automatic TLS is Component 10.
-	if err := http.ListenAndServe(cfg.Listen, handler); err != nil {
-		return err
+	httpServer := &http.Server{Addr: cfg.Listen, Handler: handler}
+
+	// The reaper sweeps idle/lifetime/orphan sessions and destroys leaked
+	// instances. It runs in dev mode too (teardown is a no-op without a
+	// provider, but idle/lifetime reaping still applies).
+	go srv.RunReaper(ctx)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.ListenAndServe() }()
+
+	select {
+	case err := <-serveErr:
+		// ListenAndServe always returns a non-nil error; ErrServerClosed is the
+		// benign "we shut it down" case.
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		log.Printf("ecu: shutting down")
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdownCtx)
 	return nil
 }

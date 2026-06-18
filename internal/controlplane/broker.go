@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/backhand/ecu/internal/tunnel"
 	"github.com/coder/websocket"
@@ -103,6 +104,13 @@ func (s *Server) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateSessionStatus(sessionID, statusReady); err != nil {
 		log.Printf("ecu broker: mark session %s ready: %v", sessionID, err)
 	}
+	// The agent is connected, so clear any prior tunnel-loss stamp: the
+	// orphan/reconnect window the reaper measures must not count time the
+	// session now has a live tunnel. Real wall-clock semantics here (a zero
+	// time clears the column); the reaper alone uses the injected clock.
+	if err := s.store.SetSessionTunnelLost(sessionID, time.Time{}); err != nil {
+		log.Printf("ecu broker: clear session %s tunnel-loss stamp: %v", sessionID, err)
+	}
 	log.Printf("ecu broker: session %s tunnel established", sessionID)
 
 	// Cleanup on exit: deregister and close the tunnel. Only reset the session
@@ -119,6 +127,15 @@ func (s *Server) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 			if cur, ok, _ := s.store.GetSession(sessionID); ok && cur.Status != statusTerminated {
 				if err := s.store.UpdateSessionStatus(sessionID, statusProvisioning); err != nil {
 					log.Printf("ecu broker: reset session %s status: %v", sessionID, err)
+				}
+				// Stamp the tunnel-loss instant so the reaper measures the
+				// orphan/reconnect window from now (real wall-clock time), not
+				// from the session's original created_at. If the agent
+				// redials within ProvisionTimeout+OrphanGrace the register path
+				// clears this again; otherwise the session is reaped as an
+				// orphan and its instance destroyed.
+				if err := s.store.SetSessionTunnelLost(sessionID, time.Now().UTC()); err != nil {
+					log.Printf("ecu broker: stamp session %s tunnel-loss: %v", sessionID, err)
 				}
 			}
 		}

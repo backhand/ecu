@@ -3,6 +3,7 @@ package controlplane
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -81,6 +82,24 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if err := decodeOptionalJSON(r.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
+	}
+
+	// Enforce the global active-session cap BEFORE generating an id, persisting,
+	// or provisioning anything — so a rejected request never creates a row or
+	// touches the provider. maxSessions==0 means unlimited (no check). The cap
+	// counts ACTIVE (provisioning+ready) sessions; error/terminated rows have
+	// been reaped/torn down and do not count, so a reaped session frees a slot.
+	if s.maxSessions > 0 {
+		n, err := s.store.CountActiveSessions()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if n >= s.maxSessions {
+			writeError(w, http.StatusTooManyRequests,
+				fmt.Sprintf("session cap reached: %d active sessions (max %d)", n, s.maxSessions))
+			return
+		}
 	}
 
 	id, err := store.NewSessionID()

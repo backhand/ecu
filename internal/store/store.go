@@ -52,8 +52,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at       TEXT NOT NULL,             -- RFC3339Nano
     last_activity_at TEXT NOT NULL,             -- RFC3339Nano
     tunnel_token     TEXT NOT NULL DEFAULT '',  -- opaque per-session token an agent presents at /agent/connect (C3)
-    instance_id      TEXT NOT NULL DEFAULT ''   -- provider instance id backing this session, set on provisioning (C4); '' in dev mode
+    instance_id      TEXT NOT NULL DEFAULT '',  -- provider instance id backing this session, set on provisioning (C4); '' in dev mode
+    tunnel_lost_at   TEXT NOT NULL DEFAULT ''   -- RFC3339Nano instant the LIVE tunnel was last lost; '' = never lost / currently connected. The C5 reaper measures the orphan/reconnect window from this (or boot); cleared to '' when an agent (re)connects.
 );
+
+-- Status index speeds the C5 reaper's repeated "non-terminal sessions" sweep
+-- and the active-session cap count; the account index supports the per-account
+-- count. IF NOT EXISTS keeps both idempotent across Open calls.
+CREATE INDEX IF NOT EXISTS idx_sessions_status  ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
 `
 
 // Open opens (creating if necessary) the SQLite database at dbPath, ensures the
@@ -103,6 +110,11 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Same idempotent-migration pattern for the C5 tunnel_lost_at column.
+	if err := ensureSessionTunnelLostAt(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
@@ -123,6 +135,17 @@ func ensureSessionTunnelToken(db *sql.DB) error {
 func ensureSessionInstanceID(db *sql.DB) error {
 	return ensureSessionColumn(db, "instance_id",
 		`ALTER TABLE sessions ADD COLUMN instance_id TEXT NOT NULL DEFAULT '';`)
+}
+
+// ensureSessionTunnelLostAt adds the sessions.tunnel_lost_at column if a pre-C5
+// database is missing it. Same idempotent pattern as the other ensure*
+// helpers: it inspects PRAGMA table_info(sessions) and only issues the ALTER
+// when the column is absent, so it is safe to run on every Open. The column
+// records when a session's live tunnel was last lost; the reaper uses it (or
+// boot time) to time the orphan/reconnect window.
+func ensureSessionTunnelLostAt(db *sql.DB) error {
+	return ensureSessionColumn(db, "tunnel_lost_at",
+		`ALTER TABLE sessions ADD COLUMN tunnel_lost_at TEXT NOT NULL DEFAULT '';`)
 }
 
 // ensureSessionColumn adds a column to the sessions table if it is absent. It
