@@ -21,8 +21,14 @@ Design notes:
   * `screenshot` is an explicit tool, NOT auto-attached to every action result.
     This keeps image tokens bounded. Take a screenshot when you need to look.
   * When polling after an action ("did it land yet?"), the control plane returns
-    a cheap "nochange" under the hood, so repeated screenshots of a static
-    screen cost almost nothing.
+    a cheap "nochange" under the hood. On that path the `screenshot` tool returns
+    a short TEXT sentinel instead of an Image, so repeated polls of a static
+    screen cost almost no model tokens (no image re-tokenized). `force_full`
+    forces a fresh image when the model truly wants pixels again.
+  * Click/move/scroll coordinates are taken in the LAST screenshot's pixel
+    space. If that screenshot was downscaled (`max_width`), the action tools
+    read the session's recorded scale and translate the coordinates back up to
+    native resolution, so the model can click exactly where it sees things.
 """
 
 from __future__ import annotations
@@ -84,35 +90,59 @@ def start_session(persistent: bool = False, restore: str = "") -> str:
     )
 
 
-@mcp.tool()
-def screenshot(session_id: str, max_width: int = 1280) -> Image:
+# structured_output=False: this tool returns CONTENT (an Image, or a short text
+# sentinel on the 'nochange' path), not a structured result — so FastMCP should
+# not try to build an output JSON schema from the Image|str return annotation.
+@mcp.tool(structured_output=False)
+def screenshot(
+    session_id: str, max_width: int = 1280, force_full: bool = False
+) -> Image | str:
     """Capture the current screen and return it as an image to look at.
 
     Take a screenshot when you need to SEE the screen — after a navigation, to
     verify an action landed, or to decide what to do next. You don't need one
-    after every single action. Repeated screenshots of an unchanged screen are
-    cheap (the system detects 'no change' automatically).
+    after every single action.
 
-    max_width: the image is downscaled to this width for legibility/cost.
-               1280 is a good default; lower it if you only need a rough look.
+    Repeated screenshots of an unchanged screen are cheap: when nothing has
+    changed since your last screenshot, this returns a short TEXT note
+    ("no change since last screenshot ...") INSTEAD of re-sending the image, so
+    polling 'did it land yet?' costs almost no tokens. When the screen has
+    changed you get a fresh image as usual.
+
+    max_width:  the image is downscaled to this width for legibility/cost.
+                1280 is a good default; lower it if you only need a rough look.
+                Subsequent click/move/scroll calls are automatically translated
+                into this same (downscaled) coordinate space, so click where you
+                see things.
+    force_full: ignore the 'no change' optimization and always return a fresh
+                full image — use it when you want to re-examine the pixels even
+                though the screen hasn't changed.
     """
     sess = _get(session_id)
-    shot = client().screenshot(sess, max_width=max_width)
+    shot = client().screenshot(sess, max_width=max_width, force_full=force_full)
+    if shot.mode == "nochange":
+        # Don't re-tokenize an identical frame: hand back a tiny text sentinel.
+        # `force_full=True` forces a real image if the model wants pixels again.
+        return f"no change since last screenshot (frame {shot.frame_token})"
     return Image(data=shot.png, format="png")
 
 
 @mcp.tool()
 def click(session_id: str, x: int, y: int, button: str = "left") -> str:
     """Click at pixel coordinates (x, y). button is 'left', 'right', or 'middle'.
-    Coordinates are in the screenshot's pixel space."""
-    client().click(session_id, x, y, button)
+    Coordinates are in the pixel space of the last screenshot you were shown
+    (the tools rescale to native resolution automatically if it was downscaled)."""
+    sess = _get(session_id)
+    client().click(session_id, x, y, button, scale=sess.screenshot_scale)
     return f"clicked {button} at ({x},{y})"
 
 
 @mcp.tool()
 def move(session_id: str, x: int, y: int) -> str:
-    """Move the mouse cursor to (x, y) without clicking."""
-    client().move(session_id, x, y)
+    """Move the mouse cursor to (x, y) without clicking. Coordinates are in the
+    last screenshot's pixel space (rescaled to native automatically)."""
+    sess = _get(session_id)
+    client().move(session_id, x, y, scale=sess.screenshot_scale)
     return f"moved to ({x},{y})"
 
 
@@ -134,8 +164,11 @@ def key(session_id: str, keys: str) -> str:
 @mcp.tool()
 def scroll(session_id: str, x: int, y: int, dx: int = 0, dy: int = 0) -> str:
     """Scroll at (x, y). Positive dy scrolls down, negative up; dx scrolls
-    horizontally. Magnitudes are scroll 'clicks'."""
-    client().scroll(session_id, x, y, dx, dy)
+    horizontally. Magnitudes are scroll 'clicks'. The (x, y) anchor is in the
+    last screenshot's pixel space (rescaled to native automatically); dx/dy are
+    scroll clicks and are not rescaled."""
+    sess = _get(session_id)
+    client().scroll(session_id, x, y, dx, dy, scale=sess.screenshot_scale)
     return f"scrolled dx={dx} dy={dy} at ({x},{y})"
 
 

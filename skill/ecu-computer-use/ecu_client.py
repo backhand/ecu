@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import requests
 
@@ -57,9 +59,19 @@ class Session:
     persistent: bool = False
     width: int = 0
     height: int = 0
+    # Scale factor of the LAST screenshot returned for this session:
+    # scale = native_width / shown_width. 1.0 means the last frame was shown at
+    # native resolution (no downscale). It is > 1.0 when the frame was downscaled
+    # (e.g. a 1280px-native frame shown at max_width=640 has scale 2.0). The
+    # front-ends multiply model-supplied (shown-space) click/move/scroll
+    # coordinates by this factor to recover native-space coordinates for the
+    # server, keeping the coordinate space consistent with what the model saw.
+    screenshot_scale: float = 1.0
     # Cached last full frame (raw PNG bytes) + its frame_token, for diffing.
+    # The token is an integer on the wire; we keep the field permissive (it may
+    # arrive as int or str) and echo back whatever value we were given as `since`.
     _base_png: Optional[bytes] = field(default=None, repr=False)
-    _base_token: Optional[str] = field(default=None, repr=False)
+    _base_token: Optional[Union[int, str]] = field(default=None, repr=False)
 
 
 class ECUClient:
@@ -167,11 +179,23 @@ class ECUClient:
         return self._request("DELETE", f"/sessions/{session_id}")
 
     # ---- actions ---------------------------------------------------------
+    #
+    # Coordinate scaling (`scale`): when the last screenshot was downscaled for
+    # the model, the model reasons in SHOWN-space pixels, but the server expects
+    # NATIVE-space pixels. Pass `scale = native_width / shown_width` (i.e. the
+    # `Session.screenshot_scale` from the last screenshot) and these methods
+    # translate the anchor coordinate up to native space before sending:
+    #   native = round(shown * scale)
+    # `scale=1.0` (the default) is a no-op, so callers that never downscale —
+    # or that already work in native space — are unaffected. Scroll *deltas*
+    # (dx, dy) are scroll "clicks", not coordinates, and are NEVER scaled.
 
-    def click(self, session_id, x, y, button="left"):
+    def click(self, session_id, x, y, button="left", scale: float = 1.0):
+        x, y = _scale_xy(x, y, scale)
         return self._action(session_id, "click", {"x": x, "y": y, "button": button})
 
-    def move(self, session_id, x, y):
+    def move(self, session_id, x, y, scale: float = 1.0):
+        x, y = _scale_xy(x, y, scale)
         return self._action(session_id, "move", {"x": x, "y": y})
 
     def type(self, session_id, text):
@@ -180,13 +204,18 @@ class ECUClient:
     def key(self, session_id, keys):
         return self._action(session_id, "key", {"keys": keys})
 
-    def scroll(self, session_id, x, y, dx=0, dy=0):
+    def scroll(self, session_id, x, y, dx=0, dy=0, scale: float = 1.0):
+        # Only the (x, y) anchor is a coordinate; dx/dy are scroll clicks.
+        x, y = _scale_xy(x, y, scale)
         return self._action(session_id, "scroll", {"x": x, "y": y, "dx": dx, "dy": dy})
 
     def exec(self, session_id, command):
         return self._action(session_id, "exec", {"command": command})
 
     def _action(self, session_id: str, name: str, body: dict) -> dict:
+        """Low-level action POST. Sends `body` verbatim — no coordinate scaling.
+        The scale-aware translation lives in click/move/scroll above; this raw
+        path is kept intact for callers that already have native coordinates."""
         return self._request("POST", f"/sessions/{session_id}/{name}", json=body)
 
     # ---- screenshots (diff-aware) ---------------------------------------
@@ -210,38 +239,63 @@ class ECUClient:
 
         max_width: if set, downscale the returned image so its width <= max_width
                    before handing it to a model. Downscaling is the primary
-                   *token* lever; keep it modest enough to stay legible.
+                   *token* lever; keep it modest enough to stay legible. When a
+                   downscale happens, the returned Screenshot's `scale` (and the
+                   Session's `screenshot_scale`) record native_width/shown_width
+                   so a later click/move/scroll can translate model coordinates
+                   back to native pixels (see ECUClient.click).
         force_full: ignore the cache and demand a full frame.
         """
         body = {"mode": "full" if force_full else "auto"}
-        if sess._base_token and not force_full:
+        if sess._base_token is not None and not force_full:
+            # Echo back whatever token value we hold (int or str) as `since`.
             body["since"] = sess._base_token
         data = self._request("POST", f"/sessions/{sess.session_id}/screenshot", json=body)
         mode = data.get("mode")
+        frame_token = data.get("frame_token")
 
         if mode == "nochange":
             if sess._base_png is None:
                 # We claimed to hold a frame but don't — recover by forcing full.
                 return self.screenshot(sess, max_width=max_width, force_full=True)
             png = sess._base_png
+            # Keep our cached token current (the server reports the live frame).
+            if frame_token is not None:
+                sess._base_token = frame_token
 
         elif mode == "full":
             png = base64.b64decode(data["image"])
             sess._base_png = png
-            sess._base_token = data.get("frame_token")
+            sess._base_token = frame_token
             sess.width = int(data.get("width", sess.width))
             sess.height = int(data.get("height", sess.height))
 
         elif mode == "diff":
             png = self._apply_diff(sess, data)
             sess._base_png = png
-            sess._base_token = data.get("frame_token")
+            sess._base_token = frame_token
 
         else:
             raise ECUError(f"unexpected screenshot mode: {mode!r}")
 
+        # native_width is the reconstructed full-frame width *before* downscale;
+        # shown_width (w) is what we actually return. Compute the scale the
+        # front-ends need to translate model coordinates back to native pixels.
+        native_width = _png_width(png)
         out_png, w, h = self._maybe_downscale(png, max_width)
-        return Screenshot(png=out_png, width=w, height=h, mode=mode or "full")
+        if max_width is None or not native_width or native_width <= max_width or not w:
+            scale = 1.0
+        else:
+            scale = native_width / w
+        sess.screenshot_scale = scale
+        return Screenshot(
+            png=out_png,
+            width=w,
+            height=h,
+            mode=mode or "full",
+            scale=scale,
+            frame_token=sess._base_token,
+        )
 
     def _apply_diff(self, sess: Session, data: dict) -> bytes:
         if not _HAVE_PIL:
@@ -285,9 +339,16 @@ class ECUClient:
 @dataclass
 class Screenshot:
     png: bytes
-    width: int
-    height: int
-    mode: str  # "full" | "diff" | "nochange" — informational
+    width: int          # shown width (after any downscale)
+    height: int         # shown height (after any downscale)
+    mode: str           # "full" | "diff" | "nochange" — informational
+    # scale = native_width / shown_width for this frame (1.0 when shown at native
+    # resolution). Persist it (CLI sidecar) / read it (MCP) so a subsequent
+    # click/move/scroll can translate model (shown-space) coords to native.
+    scale: float = 1.0
+    # The frame_token this image corresponds to (int on the wire). Useful for
+    # the "nochange" sentinel and for debugging which frame the model is seeing.
+    frame_token: Optional[Union[int, str]] = None
 
     def b64(self) -> str:
         return base64.b64encode(self.png).decode("ascii")
@@ -296,6 +357,109 @@ class Screenshot:
         with open(path, "wb") as f:
             f.write(self.png)
         return path
+
+
+# ---- coordinate / image helpers -----------------------------------------
+
+def _scale_xy(x, y, scale: float):
+    """Translate a shown-space (x, y) anchor to native-space pixels.
+
+    `scale = native_width / shown_width` (>= 1.0 after a downscale). A scale of
+    1.0 returns the inputs unchanged. Returns ints (the wire expects integers).
+    """
+    if scale == 1.0:
+        return x, y
+    return round(x * scale), round(y * scale)
+
+
+def _png_width(png: bytes) -> int:
+    """Width in pixels of a PNG, or 0 if it can't be measured (no Pillow)."""
+    if not _HAVE_PIL:
+        return 0
+    return Image.open(io.BytesIO(png)).width
+
+
+# ---- CLI sidecar cache ---------------------------------------------------
+#
+# The CLI runs as a fresh process per invocation, so without a sidecar it can
+# never send `since` (every screenshot comes back `full` — no diff/nochange
+# savings) and has nowhere to remember the downscale `scale` needed to translate
+# click coordinates. This small on-disk cache, keyed by session id, persists the
+# last frame_token, the reconstructed base PNG, the scale factor, and the native
+# width/height. Both front-ends share THIS one implementation.
+#
+# Layout (honoring $XDG_CACHE_HOME, else ~/.cache):
+#   <cache>/ecu/<session>.json   token + scale + native width/height
+#   <cache>/ecu/<session>.png    the reconstructed base frame
+#
+# Loading is best-effort: any error (missing/corrupt file, unreadable PNG)
+# yields a cold Session (no base, no token) so the next screenshot is a clean
+# full frame. The cache must never crash a command.
+
+
+def session_cache_dir() -> Path:
+    """Directory holding the sidecar cache, honoring $XDG_CACHE_HOME."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return Path(base) / "ecu"
+
+
+def _cache_paths(session_id: str) -> tuple[Path, Path]:
+    d = session_cache_dir()
+    return d / f"{session_id}.json", d / f"{session_id}.png"
+
+
+def load_session_cache(session_id: str) -> Session:
+    """Hydrate a Session from the sidecar cache, or return a cold one.
+
+    Sets `_base_png`, `_base_token`, `screenshot_scale`, and width/height from
+    disk when available so the next `screenshot()` can send `since` (cheap
+    diff/nochange path) and click/move/scroll can scale coordinates. On ANY
+    load error this returns a cold Session (status "ready", no base/token) so a
+    bad or absent cache never breaks the command — it just costs a full frame.
+    """
+    sess = Session(session_id=session_id, status="ready")
+    json_path, png_path = _cache_paths(session_id)
+    try:
+        meta = json.loads(json_path.read_text())
+        sess._base_token = meta.get("frame_token")
+        sess.screenshot_scale = float(meta.get("scale", 1.0))
+        sess.width = int(meta.get("width", 0))
+        sess.height = int(meta.get("height", 0))
+        if png_path.exists():
+            sess._base_png = png_path.read_bytes()
+        else:
+            # Token without a base frame is unusable; force a cold full frame.
+            sess._base_token = None
+    except Exception:
+        # Missing or corrupt cache — fall back to cold (full-frame) behavior.
+        return Session(session_id=session_id, status="ready")
+    return sess
+
+
+def save_session_cache(session_id: str, sess: Session) -> None:
+    """Persist a Session's base frame + token + scale + native dims to disk.
+
+    Best-effort: creates the cache dir if missing and ignores write errors (a
+    failed cache write must not break the command — it only forfeits the cheap
+    path next time).
+    """
+    json_path, png_path = _cache_paths(session_id)
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        if sess._base_png is not None:
+            png_path.write_bytes(sess._base_png)
+        meta = {
+            "frame_token": sess._base_token,
+            "scale": sess.screenshot_scale,
+            "width": sess.width,
+            "height": sess.height,
+        }
+        json_path.write_text(json.dumps(meta))
+    except Exception:
+        # Caching is an optimization; never fail the caller because of it.
+        pass
 
 
 def _safe_detail(resp) -> str:
