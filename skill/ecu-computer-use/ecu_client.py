@@ -288,6 +288,109 @@ class ECUClient:
     def exec(self, session_id, command):
         return self._action(session_id, "exec", {"command": command})
 
+    # Anchor fields scaled (shown-space -> native) for batch actions, by action.
+    # Only the pointer ANCHOR is a coordinate; scroll dx/dy are scroll clicks and
+    # are never scaled (the same rule click/move/scroll above follow).
+    _BATCH_ANCHOR_ACTIONS = frozenset({"click", "move", "scroll"})
+
+    def actions(
+        self,
+        sess: Session,
+        actions: list[dict],
+        screenshot: Optional[dict] = None,
+        scale: Optional[float] = None,
+    ) -> dict:
+        """Run an ordered batch of actions + an optional trailing screenshot in
+        ONE round-trip (protocol #5), and reconstruct the trailing frame.
+
+        Collapses a GUI sequence (e.g. click address bar -> type URL -> Enter ->
+        screenshot) that today costs N reverse-tunnel round-trips into a single
+        ``POST /sessions/{id}/actions`` exchange. The server executes the actions
+        in order (reusing the same per-action logic as the individual endpoints)
+        and, if a trailing ``screenshot`` is requested AND every action
+        succeeded, captures one frame with the same diff protocol as
+        ``screenshot()``.
+
+        ``actions``: a list of ``{"action": "<click|move|type|key|scroll|exec>",
+            ...}`` items, each carrying the SAME fields as the matching
+            single-action method. The list is NOT mutated — a new list of scaled
+            item dicts is built and sent.
+
+        Coordinate scaling: every item whose ``action`` is ``click``/``move``/
+            ``scroll`` has its ``x``/``y`` ANCHOR scaled from shown-space to
+            native via ``_scale_xy(x, y, scale)`` BEFORE sending, exactly like
+            ``click()``/``move()``/``scroll()`` do. Scroll ``dx``/``dy`` (scroll
+            clicks) and all non-anchor fields (``text``/``keys``/``command``/
+            ``button``/``timeout``) are left untouched. ``scale`` defaults to
+            ``None`` meaning "use ``sess.screenshot_scale``" (what the MCP/CLI
+            front-ends pass after a downscaled screenshot); pass an explicit
+            ``scale`` to override, or ``1.0`` for a no-op.
+
+        ``screenshot``: an optional trailing-screenshot request dict mirroring
+            the ``POST /screenshot`` body (``since``/``mode``/``max_width``/
+            ``format``/``quality``); passed through verbatim in the POST body. It
+            is honored by the server only if every action succeeded.
+
+        Returns ``{"results": [...], "screenshot": <Screenshot or None>}``:
+          * ``results`` is the server's per-action results list VERBATIM — each
+            entry is ``{"ok": true}`` (a GUI action), an exec result
+            ``{"stdout","stderr","code"}``, or ``{"ok": false, "error": ...}``
+            for the action that failed (the batch stops there; later actions did
+            not run). Inspect it for the per-action outcome.
+          * ``screenshot`` is a fully reconstructed ``Screenshot`` when the
+            response carried a trailing screenshot (all actions succeeded and one
+            was requested), else ``None``. It is reconstructed through the SAME
+            diff/nochange/full path ``screenshot()`` uses (the shared
+            ``_screenshot_from_response`` helper), so a ``diff`` composites onto
+            the session base, a ``nochange`` returns the cached bytes, and the
+            coordinate scale is recorded on ``sess``.
+
+        The whole call goes through ``_request`` so it holds the per-session lock
+        (serialized against other calls to this session) for the round-trip.
+        """
+        # Resolve the scale source: explicit arg wins, else the session's last
+        # screenshot scale (the front-ends' default), else a 1.0 no-op.
+        eff_scale = sess.screenshot_scale if scale is None else scale
+
+        # Build a NEW list of (possibly) scaled item dicts; never mutate caller's.
+        scaled: list[dict] = []
+        for item in actions:
+            new_item = dict(item)
+            if (
+                new_item.get("action") in self._BATCH_ANCHOR_ACTIONS
+                and "x" in new_item
+                and "y" in new_item
+            ):
+                nx, ny = _scale_xy(new_item["x"], new_item["y"], eff_scale)
+                new_item["x"], new_item["y"] = nx, ny
+            scaled.append(new_item)
+
+        body: dict = {"actions": scaled}
+        if screenshot is not None:
+            body["screenshot"] = screenshot
+
+        data = self._request(
+            "POST", f"/sessions/{sess.session_id}/actions", json=body
+        )
+
+        results = data.get("results", [])
+        shot: Optional[Screenshot] = None
+        raw_shot = data.get("screenshot")
+        if raw_shot is not None:
+            # Reconstruct the trailing frame identically to screenshot(): compose
+            # diffs onto the session base, honor nochange, derive + record scale.
+            # Use the trailing-screenshot request's encoding params (so the
+            # no-base recovery path re-fetches a matching full frame).
+            sshot = screenshot or {}
+            shot = self._screenshot_from_response(
+                sess,
+                raw_shot,
+                max_width=sshot.get("max_width"),
+                format=sshot.get("format", "jpeg"),
+                quality=sshot.get("quality", 75),
+            )
+        return {"results": results, "screenshot": shot}
+
     def _action(self, session_id: str, name: str, body: dict) -> dict:
         """Low-level action POST. Sends `body` verbatim — no coordinate scaling.
         The scale-aware translation lives in click/move/scroll above; this raw
@@ -345,6 +448,31 @@ class ECUClient:
             # Echo back whatever token value we hold (int or str) as `since`.
             body["since"] = sess._base_token
         data = self._request("POST", f"/sessions/{sess.session_id}/screenshot", json=body)
+        return self._screenshot_from_response(
+            sess, data, max_width=max_width, format=format, quality=quality
+        )
+
+    def _screenshot_from_response(
+        self,
+        sess: Session,
+        data: dict,
+        max_width: Optional[int],
+        format: str,
+        quality: int,
+    ) -> "Screenshot":
+        """Turn a raw screenshot-protocol response dict into a full ``Screenshot``.
+
+        This is the diff/nochange/full reconstruction core, factored out of
+        ``screenshot()`` so the trailing screenshot returned by a batch
+        ``actions()`` reconstructs IDENTICALLY: it composites a ``diff`` onto
+        the session's in-memory base, returns the cached bytes on ``nochange``,
+        caches a ``full`` as the new base, and derives ``scale = native_width /
+        shown_width`` (recording it on the Session) — exactly as a standalone
+        ``screenshot()`` would. The ``max_width``/``format``/``quality`` are the
+        request encoding params, threaded through only so the no-base recovery
+        path can re-fetch a matching full frame. ``data`` is the response body
+        (already through ``_request``); we never issue the original request here.
+        """
         mode = data.get("mode")
         frame_token = data.get("frame_token")
 

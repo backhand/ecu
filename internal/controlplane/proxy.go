@@ -6,7 +6,11 @@ import (
 )
 
 // allowedActions is the set of tool actions the proxy will forward, matching
-// the API contract and the Component-1 tool server surface.
+// the API contract and the Component-1 tool server surface. "actions" is the
+// batch/macro endpoint (protocol #5): an ordered list of the other actions plus
+// an optional trailing screenshot, run server-side in one exchange. The generic
+// {action} handler streams its body + content-type through unchanged, so no
+// special-casing is needed here beyond admitting the name.
 var allowedActions = map[string]bool{
 	"click":      true,
 	"move":       true,
@@ -15,6 +19,7 @@ var allowedActions = map[string]bool{
 	"scroll":     true,
 	"exec":       true,
 	"screenshot": true,
+	"actions":    true,
 }
 
 // handleAction proxies POST /sessions/{id}/{action} to the session's tool

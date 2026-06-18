@@ -347,6 +347,170 @@ class CoordinateScalingTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Protocol #5: batch/macro action endpoint (client `actions()`)
+# --------------------------------------------------------------------------
+
+class BatchActionsTest(unittest.TestCase):
+    def test_batch_scales_each_anchor_and_does_not_mutate_input(self):
+        """With scale 2.0, every click/move/scroll ANCHOR in the batch is doubled
+        on the wire, while type/key fields and scroll dx/dy are untouched — and
+        the caller's input list is NOT mutated in place."""
+        # A downscaled full frame sets the session scale to 2.0 (1280 / 640).
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+            {"results": [{"ok": True}, {"ok": True}, {"ok": True}, {"ok": True}]},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=640)
+        self.assertAlmostEqual(sess.screenshot_scale, 2.0)
+
+        original = [
+            {"action": "click", "x": 320, "y": 200, "button": "right"},
+            {"action": "move", "x": 100, "y": 50},
+            {"action": "type", "text": "mailon.ai"},
+            {"action": "scroll", "x": 10, "y": 20, "dx": 3, "dy": -4},
+        ]
+        # Snapshot a deep-ish copy to prove non-mutation afterwards.
+        import copy
+        before = copy.deepcopy(original)
+
+        # scale defaults to None -> uses sess.screenshot_scale (2.0).
+        out = client.actions(sess, original)
+
+        sent = client.calls[-1]["body"]["actions"]
+        self.assertEqual(client.calls[-1]["path"], "/sessions/s1/actions")
+        # click anchor doubled; button preserved.
+        self.assertEqual((sent[0]["x"], sent[0]["y"]), (640, 400))
+        self.assertEqual(sent[0]["button"], "right")
+        # move anchor doubled.
+        self.assertEqual((sent[1]["x"], sent[1]["y"]), (200, 100))
+        # type text untouched.
+        self.assertEqual(sent[2]["text"], "mailon.ai")
+        self.assertNotIn("x", sent[2])
+        # scroll anchor doubled; dx/dy NOT scaled (scroll clicks).
+        self.assertEqual((sent[3]["x"], sent[3]["y"]), (20, 40))
+        self.assertEqual((sent[3]["dx"], sent[3]["dy"]), (3, -4))
+
+        # The caller's list was not mutated (still the original shown-space coords).
+        self.assertEqual(original, before)
+        # results passed through verbatim; no trailing screenshot requested.
+        self.assertEqual(len(out["results"]), 4)
+        self.assertIsNone(out["screenshot"])
+
+    def test_explicit_scale_overrides_session_scale(self):
+        """An explicit scale arg overrides sess.screenshot_scale; scale=1.0 is a
+        no-op even when the session recorded a downscale."""
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+            {"results": [{"ok": True}]},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=640)
+        self.assertAlmostEqual(sess.screenshot_scale, 2.0)
+
+        client.actions(sess, [{"action": "click", "x": 11, "y": 22}], scale=1.0)
+        sent = client.calls[-1]["body"]["actions"]
+        self.assertEqual((sent[0]["x"], sent[0]["y"]), (11, 22))  # unscaled
+
+    def test_batch_trailing_full_screenshot_reconstructs(self):
+        """A batch whose response carries a `full` trailing screenshot returns a
+        reconstructed Screenshot (right mode, decoded png, derived scale), and
+        passes the per-action results through."""
+        # 1280-native frame shown at width 640 -> scale 2.0; real PNG via _png.
+        shown = _png(640, 400, (12, 34, 56))
+        client = ScriptedClient([
+            {"results": [{"ok": True}, {"ok": True}],
+             "screenshot": {
+                 "mode": "full", "frame_token": 7,
+                 "width": 640, "height": 400,
+                 "native_width": 1280, "native_height": 800,
+                 "image": _b64(shown)}},
+        ])
+        sess = Session(session_id="s1", status="ready")
+
+        out = client.actions(
+            sess,
+            [{"action": "click", "x": 5, "y": 5}, {"action": "key", "keys": "Return"}],
+            screenshot={"format": "png", "max_width": 640},
+        )
+
+        # Per-action results passed through.
+        self.assertEqual(out["results"], [{"ok": True}, {"ok": True}])
+        # Trailing screenshot reconstructed as a real Screenshot.
+        shot = out["screenshot"]
+        self.assertIsInstance(shot, Screenshot)
+        self.assertEqual(shot.mode, "full")
+        self.assertEqual(shot.width, 640)
+        self.assertAlmostEqual(shot.scale, 2.0)              # 1280 / 640
+        self.assertAlmostEqual(sess.screenshot_scale, 2.0)   # recorded on session
+        self.assertEqual(shot.frame_token, 7)
+        # The png reconstructs to the shown frame (normalized to PNG).
+        out_img = PILImage.open(io.BytesIO(shot.png)).convert("RGB")
+        self.assertEqual(out_img.size, (640, 400))
+        self.assertEqual(out_img.getpixel((0, 0)), (12, 34, 56))
+        # The session now holds this as its base (frame_token + base png set).
+        self.assertEqual(sess._base_token, 7)
+
+    def test_batch_trailing_diff_screenshot_composites_onto_base(self):
+        """Establish a base full frame first, then a batch whose trailing
+        screenshot is a `diff`: the diff region must composite onto the session
+        base (the same reconstruction screenshot() does)."""
+        base_png = _png(128, 96, (0, 0, 0))
+        patch_png = _png(20, 10, (255, 0, 0))
+        client = ScriptedClient([
+            # Establish the base via a normal screenshot.
+            {"mode": "full", "frame_token": 1, "width": 128, "height": 96,
+             "native_width": 128, "native_height": 96, "image": _b64(base_png)},
+            # The batch's trailing screenshot is a diff against that base.
+            {"results": [{"ok": True}],
+             "screenshot": {
+                 "mode": "diff", "frame_token": 2, "base_token": 1,
+                 "width": 128, "height": 96,
+                 "native_width": 128, "native_height": 96,
+                 "regions": [{"x": 40, "y": 30, "w": 20, "h": 10,
+                              "image": _b64(patch_png)}]}},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=None)  # base established
+
+        out = client.actions(
+            sess,
+            [{"action": "type", "text": "x"}],
+            screenshot={"max_width": None},
+        )
+        shot = out["screenshot"]
+        self.assertIsInstance(shot, Screenshot)
+        self.assertEqual(shot.mode, "diff")
+        composed = PILImage.open(io.BytesIO(shot.png)).convert("RGB")
+        # Patch composited at (40,30); surroundings still the black base.
+        self.assertEqual(composed.getpixel((45, 35)), (255, 0, 0))
+        self.assertEqual(composed.getpixel((39, 30)), (0, 0, 0))
+        self.assertEqual(composed.getpixel((0, 0)), (0, 0, 0))
+        self.assertEqual(sess._base_token, 2)
+
+    def test_batch_error_returns_partial_results_and_no_screenshot(self):
+        """When the batch errored (a result has ok=false and the response carries
+        no screenshot key), actions() returns the partial results and
+        screenshot=None — even if a trailing screenshot was requested."""
+        client = ScriptedClient([
+            {"results": [{"ok": True}, {"ok": False, "error": "unknown action: 'frob'"}]},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        out = client.actions(
+            sess,
+            [{"action": "click", "x": 1, "y": 2}, {"action": "frob"}],
+            screenshot={"format": "png"},
+        )
+        self.assertEqual(len(out["results"]), 2)
+        self.assertFalse(out["results"][1]["ok"])
+        self.assertIsNone(out["screenshot"])
+
+
+# --------------------------------------------------------------------------
 # Fix #5: CLI sidecar cache
 # --------------------------------------------------------------------------
 

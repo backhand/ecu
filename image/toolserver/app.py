@@ -200,6 +200,90 @@ _XBUTTON = {"left": 1, "middle": 2, "right": 3}
 _XSCROLL = {"up": 4, "down": 5, "left": 6, "right": 7}
 
 
+# --- per-action executors (shared by the individual endpoints AND /actions) --
+#
+# The actual input/exec logic lives in these small helpers so the single-action
+# endpoints (/click, /move, ...) and the batch /actions endpoint drive the EXACT
+# same code path: same hand-built, capture-free, no-`--sync` xdotool commands
+# through `_xdotool`, and the same `sh -c` exec runner. There is no second
+# implementation of an action to drift — /actions is a thin loop over these.
+
+
+async def _do_click(x: int, y: int, button: str = "left") -> None:
+    """Move-then-click at (x, y) in one capture-free xdotool call (no --sync)."""
+    await _xdotool(f"mousemove {x} {y} click {_XBUTTON[button]}")
+
+
+async def _do_move(x: int, y: int) -> None:
+    """Move the pointer to (x, y), capture-free, no --sync."""
+    await _xdotool(f"mousemove {x} {y}")
+
+
+async def _do_type(text: str) -> None:
+    """Type ``text`` at the focus with the demo's cadence (--delay 12)."""
+    await _xdotool(f"type --delay 12 -- {shlex.quote(text)}")
+
+
+async def _do_key(keys: str) -> None:
+    """Press an xdotool key/chord, e.g. ``Return`` / ``ctrl+l`` / ``alt+F4``."""
+    await _xdotool(f"key -- {keys}")
+
+
+async def _do_scroll(x: int, y: int, dx: int = 0, dy: int = 0) -> None:
+    """Scroll at (x, y): one wheel-button burst per nonzero axis.
+
+    Builds the SAME single mousemove + ``click --repeat N <wheel>`` bursts the
+    ``/scroll`` handler builds (dy>0 down / dy<0 up, dx>0 right / dx<0 left),
+    both axes in ONE xdotool call. A zero-zero scroll is a no-op (no xdotool
+    call at all) that still counts as a successful action.
+    """
+    parts = [f"mousemove {x} {y}"]
+    if dy:
+        parts.append(
+            f"click --repeat {abs(dy)} "
+            f"{_XSCROLL['down'] if dy > 0 else _XSCROLL['up']}"
+        )
+    if dx:
+        parts.append(
+            f"click --repeat {abs(dx)} "
+            f"{_XSCROLL['right'] if dx > 0 else _XSCROLL['left']}"
+        )
+    if len(parts) == 1:
+        return  # no-op scroll (dx==dy==0): nothing to do
+    await _xdotool(" ".join(parts))
+
+
+def _exec_run(command: str, timeout: float | None) -> dict:
+    """Run ``sh -c <command>`` (blocking) and return {stdout, stderr, code}.
+
+    The single source of truth for /exec semantics: a one-shot ``sh -c`` (no
+    persistent shell), with a timeout (default handled by the caller / model)
+    that maps a TimeoutExpired to ``code == 124`` and an appended note on
+    stderr. Both the /exec endpoint and the batch ``exec`` action call this via
+    ``asyncio.to_thread`` so the blocking subprocess never stalls the loop.
+    """
+    try:
+        proc = subprocess.run(
+            ["sh", "-c", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return {
+            "stdout": proc.stdout.decode(errors="replace"),
+            "stderr": proc.stderr.decode(errors="replace"),
+            "code": proc.returncode,
+        }
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode(errors="replace") if exc.stdout else ""
+        err = exc.stderr.decode(errors="replace") if exc.stderr else ""
+        return {
+            "stdout": out,
+            "stderr": err + f"\ncommand timed out after {timeout}s",
+            "code": 124,
+        }
+
+
 class _FrameState:
     """The instance's single base frame: encoded bytes, decoded pixels, token.
 
@@ -521,6 +605,27 @@ class ExecBody(BaseModel):
     timeout: float | None = Field(default=120.0, gt=0)
 
 
+class ActionsBody(BaseModel):
+    """Batch/macro request: an ordered list of actions + an optional trailing
+    screenshot, executed server-side in ONE exchange (protocol #5).
+
+    ``actions`` is deliberately a list of *plain dicts* (not a typed union) so
+    that an unknown ``action`` value or a missing per-action field becomes a
+    RECORDED per-action error that stops the batch (see ``/actions``), rather
+    than a FastAPI 422 that rejects the whole request before any action runs.
+    Each item is ``{"action": "<click|move|type|key|scroll|exec>", ...}`` with
+    the SAME fields as the matching single-action endpoint.
+
+    ``screenshot`` mirrors ``ScreenshotBody`` (``since``/``mode``/``max_width``/
+    ``format``/``quality``); it is validated leniently here (the sub-fields are
+    resolved/clamped by ``_normalize_encoding`` when the capture runs) and is
+    only honored when every action succeeded.
+    """
+
+    actions: list[dict]
+    screenshot: dict | None = None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -642,6 +747,65 @@ def _diff_or_full(
     }
 
 
+async def _capture_screenshot(
+    since: int | None,
+    mode: str | None,
+    fmt: str | None,
+    quality: int | None,
+    max_width: int | None,
+) -> dict:
+    """Capture a frame and resolve it to a ``full``/``diff``/``nochange`` dict.
+
+    The single source of truth for the screenshot protocol: the capture-gate
+    grab, the downscale+decode off the loop, and the same full/diff/nochange
+    decision tree. Both ``POST /screenshot`` and the trailing screenshot of
+    ``POST /actions`` go through here so they produce byte-for-byte identical
+    response shapes. Raises ``ToolActionError`` if the underlying capture fails
+    (callers map that to an error response). ``mode``/``since`` mirror
+    ``ScreenshotBody``; ``fmt``/``quality``/``max_width`` are resolved via
+    ``_normalize_encoding`` (which clamps), exactly as ``/screenshot`` does.
+    """
+    # Capture through the single-flight gate so concurrent capture requests
+    # collapse onto one scrot (and never starve the loop that input handlers
+    # need). Input endpoints do NOT use the gate.
+    png = await _capture_gate.capture()
+
+    pil_fmt, q, mw = _normalize_encoding(fmt, quality, max_width)
+
+    def _prepare() -> tuple[np.ndarray, int, int]:
+        native = _decode_rgb(png)
+        native_h, native_w = native.shape[:2]
+        shown = _downscale_to_width(native, mw)
+        return shown, native_w, native_h
+
+    pixels, native_w, native_h = await asyncio.to_thread(_prepare)
+    base_token, _base_image, base_pixels, base_width = _frames.snapshot()
+
+    # Forced full / first frame / caller's base doesn't match ours, or the
+    # requested max_width yields a different shown width than the held base (a
+    # different base size can't be tile-diffed) -> full.
+    if (
+        mode == "full"
+        or base_pixels is None
+        or since != base_token
+        or base_width != pixels.shape[1]
+    ):
+        return await asyncio.to_thread(
+            _full_response, pixels, native_w, native_h, pil_fmt, q
+        )
+
+    return await asyncio.to_thread(
+        _diff_or_full,
+        pixels,
+        base_token,
+        base_pixels,
+        native_w,
+        native_h,
+        pil_fmt,
+        q,
+    )
+
+
 @app.post("/screenshot")
 async def screenshot(body: ScreenshotBody) -> JSONResponse:
     """Capture a frame, downscale + lossy-encode it, and return it as ``full``,
@@ -666,50 +830,11 @@ async def screenshot(body: ScreenshotBody) -> JSONResponse:
     complete frame before showing it to a model (it never sees a diff).
     """
     try:
-        # Capture through the single-flight gate so concurrent /screenshot
-        # requests collapse onto one scrot (and never starve the loop that input
-        # handlers need). Input endpoints do NOT use the gate.
-        png = await _capture_gate.capture()
+        payload = await _capture_screenshot(
+            body.since, body.mode, body.format, body.quality, body.max_width
+        )
     except ToolActionError as exc:
         return _err(str(exc))
-
-    pil_fmt, quality, max_width = _normalize_encoding(
-        body.format, body.quality, body.max_width
-    )
-
-    def _prepare() -> tuple[np.ndarray, int, int]:
-        native = _decode_rgb(png)
-        native_h, native_w = native.shape[:2]
-        shown = _downscale_to_width(native, max_width)
-        return shown, native_w, native_h
-
-    pixels, native_w, native_h = await asyncio.to_thread(_prepare)
-    base_token, _base_image, base_pixels, base_width = _frames.snapshot()
-
-    # Forced full / first frame / caller's base doesn't match ours, or the
-    # requested max_width yields a different shown width than the held base (a
-    # different base size can't be tile-diffed) -> full.
-    if (
-        body.mode == "full"
-        or base_pixels is None
-        or body.since != base_token
-        or base_width != pixels.shape[1]
-    ):
-        payload = await asyncio.to_thread(
-            _full_response, pixels, native_w, native_h, pil_fmt, quality
-        )
-        return JSONResponse(payload)
-
-    payload = await asyncio.to_thread(
-        _diff_or_full,
-        pixels,
-        base_token,
-        base_pixels,
-        native_w,
-        native_h,
-        pil_fmt,
-        quality,
-    )
     return JSONResponse(payload)
 
 
@@ -718,7 +843,7 @@ async def click(body: ClickBody) -> JSONResponse:
     # Move-then-click in one xdotool invocation, WITHOUT --sync (which hangs ~16 s
     # on this WM) and WITHOUT the demo's post-action capture. ~0.15 s vs ~18 s.
     try:
-        await _xdotool(f"mousemove {body.x} {body.y} click {_XBUTTON[body.button]}")
+        await _do_click(body.x, body.y, body.button)
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -727,7 +852,7 @@ async def click(body: ClickBody) -> JSONResponse:
 @app.post("/move")
 async def move(body: MoveBody) -> JSONResponse:
     try:
-        await _xdotool(f"mousemove {body.x} {body.y}")
+        await _do_move(body.x, body.y)
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -739,7 +864,7 @@ async def type_(body: TypeBody) -> JSONResponse:
     # directly so it skips the demo's trailing full screenshot (an input action
     # must not capture). The text is shlex-quoted; xdotool handles long strings.
     try:
-        await _xdotool(f"type --delay 12 -- {shlex.quote(body.text)}")
+        await _do_type(body.text)
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -750,7 +875,7 @@ async def key(body: KeyBody) -> JSONResponse:
     # `xdotool key -- <keys>`: xdotool chord syntax, e.g. "ctrl+l", "Return",
     # "alt+F4". Direct (no post-action capture); key has no --sync to worry about.
     try:
-        await _xdotool(f"key -- {body.keys}")
+        await _do_key(body.keys)
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -764,23 +889,10 @@ async def scroll(body: ScrollBody) -> JSONResponse:
     <wheel-button>``: dy>0 down / dy<0 up, dx>0 right / dx<0 left) but built
     directly so it skips ``mousemove --sync`` (the ~16 s hang) and the demo's
     post-action capture. Both axes go in ONE xdotool call so the move applies to
-    both bursts.
+    both bursts. (Builds the bursts via the shared ``_do_scroll`` executor.)
     """
-    parts = [f"mousemove {body.x} {body.y}"]
-    if body.dy:
-        parts.append(
-            f"click --repeat {abs(body.dy)} "
-            f"{_XSCROLL['down'] if body.dy > 0 else _XSCROLL['up']}"
-        )
-    if body.dx:
-        parts.append(
-            f"click --repeat {abs(body.dx)} "
-            f"{_XSCROLL['right'] if body.dx > 0 else _XSCROLL['left']}"
-        )
-    if len(parts) == 1:
-        return _ok()  # no-op scroll (dx==dy==0): nothing to do
     try:
-        await _xdotool(" ".join(parts))
+        await _do_scroll(body.x, body.y, body.dx, body.dy)
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -794,32 +906,171 @@ async def exec_(body: ExecBody) -> JSONResponse:
     BashTool keeps a persistent session and a sentinel protocol that does not
     surface a real per-command exit code, which is exactly what callers of
     /exec want. Timeouts/backgrounding semantics are intentionally deferred.
+    The actual run lives in the shared ``_exec_run`` helper (also used by the
+    batch ``exec`` action), driven off the loop via ``asyncio.to_thread``.
     """
-
-    def _run() -> dict:
-        try:
-            proc = subprocess.run(
-                ["sh", "-c", body.command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=body.timeout,
-            )
-            return {
-                "stdout": proc.stdout.decode(errors="replace"),
-                "stderr": proc.stderr.decode(errors="replace"),
-                "code": proc.returncode,
-            }
-        except subprocess.TimeoutExpired as exc:
-            out = exc.stdout.decode(errors="replace") if exc.stdout else ""
-            err = exc.stderr.decode(errors="replace") if exc.stderr else ""
-            return {
-                "stdout": out,
-                "stderr": err + f"\ncommand timed out after {body.timeout}s",
-                "code": 124,
-            }
-
-    result = await asyncio.to_thread(_run)
+    result = await asyncio.to_thread(_exec_run, body.command, body.timeout)
     return JSONResponse(result)
+
+
+# --- batch / macro endpoint (protocol #5) ----------------------------------
+
+
+def _require(item: dict, field: str, types: tuple) -> object:
+    """Pull a required, correctly-typed field out of a batch action item.
+
+    Raises ``ToolActionError`` (which the batch loop records as the failing
+    action's error and then stops on) if the field is missing or the wrong
+    type — so a malformed item is a recorded per-action error, NOT a 422 that
+    would reject the whole batch before any action ran. ``bool`` is excluded
+    from numeric types (``isinstance(True, int)`` is True in Python).
+    """
+    if field not in item:
+        raise ToolActionError(f"missing required field {field!r}")
+    val = item[field]
+    if isinstance(val, bool) or not isinstance(val, types):
+        want = "/".join(t.__name__ for t in types)
+        raise ToolActionError(f"field {field!r} must be {want}")
+    return val
+
+
+async def _dispatch_action(item: dict) -> dict:
+    """Execute ONE batch action item and return its result dict.
+
+    Reuses the EXACT per-action executors the single-action endpoints use
+    (``_do_click``/``_do_move``/``_do_type``/``_do_key``/``_do_scroll`` and the
+    shared ``_exec_run``) — there is no second action implementation. A GUI
+    action returns ``{"ok": true}``; ``exec`` returns ``{"stdout","stderr",
+    "code"}``. Validation is done HERE (not by Pydantic) so an unknown action,
+    a missing/ill-typed field, or an unknown button raises ``ToolActionError``
+    and is recorded as the failing action that stops the batch.
+    """
+    action = item.get("action")
+    if action == "click":
+        x = _require(item, "x", (int,))
+        y = _require(item, "y", (int,))
+        button = item.get("button", "left")
+        if button not in _XBUTTON:
+            raise ToolActionError(f"unknown button: {button}")
+        await _do_click(int(x), int(y), button)
+        return {"ok": True}
+    if action == "move":
+        x = _require(item, "x", (int,))
+        y = _require(item, "y", (int,))
+        await _do_move(int(x), int(y))
+        return {"ok": True}
+    if action == "type":
+        text = _require(item, "text", (str,))
+        await _do_type(str(text))
+        return {"ok": True}
+    if action == "key":
+        keys = _require(item, "keys", (str,))
+        await _do_key(str(keys))
+        return {"ok": True}
+    if action == "scroll":
+        x = _require(item, "x", (int,))
+        y = _require(item, "y", (int,))
+        # dx/dy default to 0 (a zero-zero scroll is a no-op that still counts ok).
+        dx = item.get("dx", 0)
+        dy = item.get("dy", 0)
+        if isinstance(dx, bool) or not isinstance(dx, int):
+            raise ToolActionError("field 'dx' must be int")
+        if isinstance(dy, bool) or not isinstance(dy, int):
+            raise ToolActionError("field 'dy' must be int")
+        await _do_scroll(int(x), int(y), int(dx), int(dy))
+        return {"ok": True}
+    if action == "exec":
+        command = _require(item, "command", (str,))
+        # Honor an optional per-item timeout (default 120.0, like ExecBody).
+        timeout = item.get("timeout", 120.0)
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        ):
+            raise ToolActionError("field 'timeout' must be a number")
+        return await asyncio.to_thread(_exec_run, str(command), timeout)
+    # Unknown (or missing) action name -> a recorded error that stops the batch.
+    raise ToolActionError(f"unknown action: {action!r}")
+
+
+@app.post("/actions")
+async def actions(body: ActionsBody) -> JSONResponse:
+    """Execute an ordered batch of actions + an optional trailing screenshot in
+    ONE request (protocol #5).
+
+    Collapses a GUI sequence (e.g. click address bar -> type URL -> Enter ->
+    screenshot) that today costs N reverse-tunnel round-trips into a single
+    exchange: the actions run server-side IN ORDER, reusing the EXACT
+    per-action logic the individual endpoints use (the capture-free, no-``--sync``
+    ``_xdotool`` input path and the shared ``sh -c`` exec runner), and an
+    optional trailing screenshot is captured with the SAME protocol ``POST
+    /screenshot`` uses.
+
+    Request body::
+
+        { "actions": [ {"action":"click","x":100,"y":50},
+                       {"action":"type","text":"mailon.ai"},
+                       {"action":"key","keys":"Return"} ],
+          "screenshot": {"format":"jpeg","quality":75,"max_width":1280,"since":123} }
+
+    Each ``actions`` item is ``{"action": "<click|move|type|key|scroll|exec>",
+    ...same fields as that individual endpoint...}``. A successful GUI action
+    yields ``{"ok": true}``; a successful ``exec`` yields ``{"stdout","stderr",
+    "code"}`` (honoring an optional per-item ``timeout``, default 120.0, exactly
+    like ``/exec``).
+
+    Error policy (stop-on-first-error): actions run in order; if one raises
+    (``ToolActionError`` from a bad key name / display down, an unknown
+    ``action`` value, a missing/ill-typed required field, or an unknown button),
+    that action's result is recorded as ``{"ok": false, "error": "<message>"}``,
+    the batch STOPS IMMEDIATELY (the remaining actions do NOT run), and the
+    trailing screenshot is SKIPPED. The response then carries the partial
+    ``results`` list (length = failed index + 1, ending in the error object) and
+    NO ``screenshot`` key.
+
+    Response body::
+
+        { "results": [ {"ok":true}, {"ok":true}, {"ok":true} ],
+          "screenshot": { ...the /screenshot response dict... } }
+
+    The ``screenshot`` key is present ONLY when a trailing screenshot was
+    requested (``screenshot`` in the body) AND every action succeeded; its value
+    is EXACTLY the dict ``/screenshot`` would have returned (same ``mode``/
+    ``frame_token``/``image``/``regions``/``width``/``height``/``native_width``/
+    ``native_height`` shape).
+    """
+    results: list[dict] = []
+    for item in body.actions:
+        try:
+            results.append(await _dispatch_action(item))
+        except ToolActionError as exc:
+            # Record the failure and STOP: the remaining actions do not run and
+            # the trailing screenshot is skipped (partial results, no screenshot).
+            results.append({"ok": False, "error": str(exc)})
+            return JSONResponse({"results": results})
+
+    # All actions succeeded. If a trailing screenshot was requested, capture it
+    # now with the same protocol /screenshot uses. NOTE: this capture happens
+    # immediately after the last action with NO settle/sleep, so the captured
+    # frame MAY precede the full render of the last action's on-screen effect
+    # (a capture-once-stable "settle" is a later protocol task).
+    if body.screenshot is not None:
+        shot = body.screenshot
+        try:
+            payload = await _capture_screenshot(
+                shot.get("since"),
+                shot.get("mode"),
+                shot.get("format"),
+                shot.get("quality"),
+                shot.get("max_width"),
+            )
+        except ToolActionError as exc:
+            # The actions all succeeded but the trailing capture itself failed
+            # (e.g. display down). Surface it as a tool error; the caller can
+            # re-screenshot. Results already reflect the successful actions.
+            return _err(str(exc))
+        return JSONResponse({"results": results, "screenshot": payload})
+
+    return JSONResponse({"results": results})
 
 
 # Live watch endpoint (Component 9): reverse-proxy the container's noVNC client

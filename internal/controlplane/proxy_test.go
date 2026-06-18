@@ -93,6 +93,71 @@ func TestProxyPassthrough(t *testing.T) {
 	}
 }
 
+// TestProxyForwardsActions verifies the batch/macro endpoint (protocol #5) is
+// admitted by allowedActions and proxied verbatim to the upstream tool server
+// at /actions — i.e. it is NOT rejected as an "unknown action". Mirrors the
+// TestProxyPassthrough setup (fake upstream + ready session).
+func TestProxyForwardsActions(t *testing.T) {
+	// Sanity: "actions" is in the allowed set (so it forwards, never 400s).
+	if !allowedActions["actions"] {
+		t.Fatalf("allowedActions[\"actions\"] = false, want true (batch endpoint)")
+	}
+
+	const upstreamBody = `{"results":[{"ok":true},{"ok":true}],"screenshot":{"mode":"full"}}`
+	var gotPath, gotBody, gotCT string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	srv := NewServer(st, "")
+
+	id, _ := store.NewSessionID()
+	if err := st.CreateSession(&store.Session{
+		ID: id, Account: "admin", Status: statusReady, ToolEndpoint: upstream.URL,
+		Width: 1280, Height: 800,
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// A batch request: two actions + a trailing screenshot.
+	reqBody := `{"actions":[{"action":"click","x":10,"y":20},{"action":"key","keys":"Return"}],"screenshot":{"format":"png"}}`
+	req := httptest.NewRequest(http.MethodPost, "/sessions/"+id+"/actions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer k_active")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	// NOT a 400 unknown-action — the batch endpoint is forwarded.
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("status = 400 (unknown action); /actions must be forwarded, not rejected")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (verbatim upstream status)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != upstreamBody {
+		t.Fatalf("body = %q, want verbatim %q", got, upstreamBody)
+	}
+
+	// The upstream received the request at /actions with the original body + CT.
+	if gotPath != "/actions" {
+		t.Fatalf("upstream path = %q, want /actions (forwarded to the batch endpoint)", gotPath)
+	}
+	if gotBody != reqBody {
+		t.Fatalf("upstream body = %q, want %q (forwarded verbatim)", gotBody, reqBody)
+	}
+	if gotCT != "application/json" {
+		t.Fatalf("upstream content-type = %q, want application/json", gotCT)
+	}
+}
+
 // TestProxyUnknownAction verifies an unsupported action yields 400 with JSON
 // detail and never touches a tool server.
 func TestProxyUnknownAction(t *testing.T) {

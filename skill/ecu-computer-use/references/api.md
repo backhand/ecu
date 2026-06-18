@@ -94,7 +94,10 @@ forwards the body verbatim to the instance's tool server and copies its status
 and body back. On success the tool server returns `{"ok": true}` (a `200`);
 `exec` returns a result object (below). Coordinates are in **native screen
 pixels** (the clients translate downscaled-screenshot coordinates to native
-before sending — see the screenshot protocol).
+before sending — see the screenshot protocol). The single-action names below
+plus the `actions` batch endpoint (which runs several of them in one exchange,
+documented after this table) make up the forwarded action surface; any other
+`{action}` segment is rejected `400 unknown action`.
 
 | Action   | Body                                  | Notes |
 |----------|---------------------------------------|-------|
@@ -116,6 +119,62 @@ persistent shell session); background long-running things yourself
 
 A tool-level failure (e.g. the X display isn't up) comes back as the tool
 server's `{ "ok": false, "error": "..." }` with a `5xx` status, copied through.
+
+### POST /sessions/{session_id}/actions
+Batch/macro endpoint: run an ordered list of actions **plus** an optional
+trailing screenshot server-side in a **single** exchange, instead of paying the
+reverse-tunnel round-trip for each step. Collapses a common GUI sequence (click
+address bar → type URL → Enter → screenshot, normally 4 requests) into one.
+
+Request:
+```json
+{ "actions": [ {"action":"click","x":100,"y":50},
+               {"action":"type","text":"mailon.ai"},
+               {"action":"key","keys":"Return"} ],
+  "screenshot": {"format":"jpeg","quality":75,"max_width":1280,"since":123} }
+```
+- `actions` (array, required): each item is `{ "action": "<name>", ...}` where
+  `action` is one of `click`/`move`/`type`/`key`/`scroll`/`exec` and the
+  remaining fields are **exactly** that single action's body (from the table
+  above): `click` `{x,y,button?}`, `move` `{x,y}`, `type` `{text}`, `key`
+  `{keys}`, `scroll` `{x,y,dx?,dy?}`, `exec` `{command,timeout?}`. Coordinates
+  are native screen pixels (the client scales each anchor before sending, same
+  as the single-action path). A zero-`dx`/`dy` `scroll` is an accepted no-op.
+- `screenshot` (object, optional): a trailing-screenshot request mirroring the
+  `POST /screenshot` body (`since`, `mode`, `max_width`, `format`, `quality` —
+  all optional, same defaults). It is captured **only if every action
+  succeeded**.
+
+Execution + error policy (**in order, stop on first error**): the actions run
+sequentially. If an action fails — a `ToolActionError` (bad key name, display
+down), an **unknown `action` value**, a **missing/ill-typed required field**, or
+an **unknown button** — that action's result is recorded as
+`{ "ok": false, "error": "<message>" }`, the batch **stops immediately** (the
+remaining actions do **not** run), and the trailing screenshot is **skipped**.
+A bad item is a recorded per-action error, never a `422` that rejects the whole
+batch.
+
+Response:
+```json
+{ "results": [ {"ok":true}, {"ok":true}, {"ok":true} ],
+  "screenshot": { "mode":"full", "frame_token":13, "width":1280, "height":800,
+                  "native_width":1280, "native_height":800, "image":"<base64>" } }
+```
+- `results` (array): one entry per action that ran, in order. A successful GUI
+  action is `{ "ok": true }`; a successful `exec` is its `{ "stdout", "stderr",
+  "code" }` result object; a failed action is `{ "ok": false, "error": "..." }`
+  and is the **last** entry (the batch stopped there). On failure the list
+  length equals *(failed index + 1)*.
+- `screenshot` (object): present **only** when a trailing `screenshot` was
+  requested **and** all actions succeeded. Its value is **exactly** a
+  screenshot-protocol response (`full`/`diff`/`nochange`, same shape as
+  `POST /screenshot` returns — see below); the client reconstructs it into a
+  full frame the same way. When any action failed, this key is **absent**.
+
+The trailing screenshot is captured **immediately** after the last action with
+**no settle/sleep**, so it may show the screen *before* the last action's effect
+has fully rendered (a capture-once-stable "settle" is a later protocol step). If
+the in-batch frame is pre-render, take a follow-up `POST /screenshot` to confirm.
 
 ## Screenshot protocol (diff-aware, downscaled + lossy at the source)
 
