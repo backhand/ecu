@@ -28,6 +28,13 @@ const (
 	defaultMaxPersistentSessions = 3
 	defaultDBPath                = "~/.local/share/ecu/ecu.db"
 	defaultConfigPath            = "~/.config/ecu/config.json"
+	// defaultProvisionTimeout bounds how long the control plane waits for a
+	// freshly provisioned instance's agent to register before tearing the
+	// instance down (C4). A cold boot pulls a container image, so minutes.
+	defaultProvisionTimeout = 5 * time.Minute
+	// defaultBaseImage is the cold-boot base OS image used when no pre-baked
+	// image is configured.
+	defaultBaseImage = "ubuntu-24.04"
 )
 
 // Config holds every ECU_* setting the control plane understands. All fields
@@ -67,6 +74,21 @@ type Config struct {
 	// Image is the pre-baked provider image name (ECU_IMAGE). Consumed by the
 	// pre-baking component (C7).
 	Image string
+
+	// BaseImage is the cold-boot base OS image (ECU_BASE_IMAGE), used by C4
+	// provisioning when no pre-baked image is available. Distinct from Image
+	// (the pre-baked image name). Defaults to defaultBaseImage.
+	BaseImage string
+
+	// AgentBinaryURL is where the instance fetches the `ecu` binary from
+	// (ECU_AGENT_BINARY_URL), injected into cloud-init (C4). C10 supplies real
+	// arch-specific release URLs.
+	AgentBinaryURL string
+
+	// ProvisionTimeout bounds how long the control plane waits for a
+	// newly-provisioned instance's agent to register before tearing it down
+	// (ECU_PROVISION_TIMEOUT). Defaults to defaultProvisionTimeout.
+	ProvisionTimeout time.Duration
 
 	// MaxSessions is the global session cap (ECU_MAX_SESSIONS). Stored now,
 	// enforced by the reaper/caps component (C5).
@@ -117,6 +139,9 @@ type fileConfig struct {
 	InstanceType          string `json:"instance_type,omitempty"`
 	Region                string `json:"region,omitempty"`
 	Image                 string `json:"image,omitempty"`
+	BaseImage             string `json:"base_image,omitempty"`
+	AgentBinaryURL        string `json:"agent_binary_url,omitempty"`
+	ProvisionTimeout      string `json:"provision_timeout,omitempty"`
 	MaxSessions           int    `json:"max_sessions,omitempty"`
 	IdleTimeout           string `json:"idle_timeout,omitempty"`
 	MaxLifetime           string `json:"max_lifetime,omitempty"`
@@ -228,6 +253,8 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	c.InstanceType = pick(env["ECU_INSTANCE_TYPE"], fileCfg.InstanceType)
 	c.Region = pick(env["ECU_REGION"], fileCfg.Region)
 	c.Image = pick(env["ECU_IMAGE"], fileCfg.Image)
+	c.BaseImage = pick(env["ECU_BASE_IMAGE"], fileCfg.BaseImage, defaultBaseImage)
+	c.AgentBinaryURL = pick(env["ECU_AGENT_BINARY_URL"], fileCfg.AgentBinaryURL)
 	c.DevToolServer = pick(env["ECU_DEV_TOOLSERVER"], fileCfg.DevToolServer)
 
 	// Integer settings.
@@ -258,6 +285,16 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	if c.MaxLifetime, err = parseDurationSetting("ECU_MAX_LIFETIME", env["ECU_MAX_LIFETIME"], fileMaxLife); err != nil {
 		return nil, false, err
 	}
+	var fileProvTimeout string
+	if fileCfg.ProvisionTimeout != 0 {
+		fileProvTimeout = fileCfg.ProvisionTimeout.String()
+	}
+	if c.ProvisionTimeout, err = parseDurationSetting("ECU_PROVISION_TIMEOUT", env["ECU_PROVISION_TIMEOUT"], fileProvTimeout); err != nil {
+		return nil, false, err
+	}
+	if c.ProvisionTimeout == 0 {
+		c.ProvisionTimeout = defaultProvisionTimeout
+	}
 
 	// Path settings: env > file > default, then expand ~.
 	c.DBPath = pick(env["ECU_DB"], fileCfg.DBPath, defaultDBPath)
@@ -269,8 +306,14 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 		return nil, false, err
 	}
 
-	// Decide based on required keys. We evaluate "present" against the merged
+	// Decide based on required keys. The caller passes the BASE required set
+	// (package-level requiredKeys, i.e. ECU_API_KEY); we augment it from the
+	// merged config so requirements are context-dependent: a production
+	// deployment (no ECU_DEV_TOOLSERVER) on the hetzner provider also needs
+	// ECU_HCLOUD_TOKEN. In dev-toolserver mode, or with a non-hetzner provider,
+	// only the base set applies. We evaluate "present" against the merged
 	// config so a value supplied by the file counts as present.
+	required = requiredFor(c, required)
 	missing := missingRequired(c, required)
 	if len(missing) == 0 {
 		return c, false, nil
@@ -282,6 +325,34 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	// No TTY and required config is missing: fail fast with a precise message.
 	return nil, false, fmt.Errorf("missing required configuration: %s (set via environment, e.g. %s, or a config file)",
 		strings.Join(missing, ", "), missing[0])
+}
+
+// requiredFor returns the effective required-key set: the supplied base set
+// plus any keys implied by the merged config. The only context-dependent
+// requirement today is the provider token: a production deployment (no
+// ECU_DEV_TOOLSERVER) using the hetzner provider must supply ECU_HCLOUD_TOKEN.
+// The dev-toolserver path provisions nothing, so it stays at the base set; a
+// non-hetzner provider has no token requirement here. The base set is never
+// dropped, so a caller asserting "only ECU_API_KEY is required" in dev mode
+// still holds.
+func requiredFor(c *Config, base []string) []string {
+	out := append([]string(nil), base...)
+	if c.DevToolServer == "" && strings.EqualFold(c.Provider, "hetzner") {
+		if !contains(out, "ECU_HCLOUD_TOKEN") {
+			out = append(out, "ECU_HCLOUD_TOKEN")
+		}
+	}
+	return out
+}
+
+// contains reports whether s is in list.
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // missingRequired returns the subset of required keys that have no value in the

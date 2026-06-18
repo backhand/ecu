@@ -17,7 +17,9 @@ package controlplane
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/backhand/ecu/internal/provider"
 	"github.com/backhand/ecu/internal/store"
 )
 
@@ -55,6 +57,45 @@ type Server struct {
 	// listenAddr is the control-plane listen address (ECU_LISTEN), used only to
 	// build the ws:// tunnel_url when exposeTunnelToken is on.
 	listenAddr string
+
+	// provider is the cloud Provider used on the production path to create and
+	// destroy instances (C4). It is nil in dev-toolserver mode (which never
+	// provisions) and in C2/C3 tests that don't exercise provisioning.
+	provider provider.Provider
+
+	// provisionCfg carries everything the production POST /sessions path needs
+	// to render cloud-init and create an instance (see ProvisionConfig).
+	provisionCfg ProvisionConfig
+}
+
+// ProvisionConfig carries the settings the production provisioning path needs.
+// It is supplied via WithProvisionConfig from cmd/ecu (derived from the loaded
+// config) and is unused in dev-toolserver mode.
+type ProvisionConfig struct {
+	// TunnelURL is the publicly reachable tunnel ingress the agent dials OUT
+	// to, e.g. "wss://ecu.example.com/agent/connect". For real cloud instances
+	// this MUST be reachable from the instance (hostname + TLS; C10). In local
+	// dev it may be "ws://<listen>/agent/connect".
+	TunnelURL string
+
+	// ImageRef is the container image cloud-init runs on the instance.
+	ImageRef string
+
+	// AgentBinaryURL is where the instance fetches the ecu binary from.
+	AgentBinaryURL string
+
+	// InstanceType / Region / BaseImage configure the created instance.
+	InstanceType string
+	Region       string
+	BaseImage    string
+
+	// Width / Height are the desktop resolution passed to the container.
+	Width, Height int
+
+	// ProvisionTimeout bounds how long the background waiter waits for the
+	// agent to register before tearing the instance down. Must be > 0 on the
+	// production path; tests inject a short value.
+	ProvisionTimeout time.Duration
 }
 
 // ServerOption customizes a Server at construction. Options keep the NewServer
@@ -72,6 +113,19 @@ func WithExposeTunnelToken(expose bool) ServerOption {
 // the dev token-exposure response (e.g. "127.0.0.1:8080").
 func WithListenAddr(addr string) ServerOption {
 	return func(s *Server) { s.listenAddr = addr }
+}
+
+// WithProvider sets the cloud Provider used by the production POST /sessions
+// path to create instances and by DELETE to destroy them (C4). A nil provider
+// is fine in dev-toolserver mode (that path never calls it).
+func WithProvider(p provider.Provider) ServerOption {
+	return func(s *Server) { s.provider = p }
+}
+
+// WithProvisionConfig supplies the settings the production provisioning path
+// needs (cloud-init inputs, instance shape, and the readiness timeout).
+func WithProvisionConfig(cfg ProvisionConfig) ServerOption {
+	return func(s *Server) { s.provisionCfg = cfg }
 }
 
 // NewServer builds a Server. The store is used for auth and session records;

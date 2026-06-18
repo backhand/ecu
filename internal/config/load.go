@@ -142,10 +142,19 @@ func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 		InstanceType:          fc.InstanceType,
 		Region:                fc.Region,
 		Image:                 fc.Image,
+		BaseImage:             fc.BaseImage,
+		AgentBinaryURL:        fc.AgentBinaryURL,
 		MaxSessions:           fc.MaxSessions,
 		MaxPersistentSessions: fc.MaxPersistentSessions,
 		DBPath:                fc.DBPath,
 		DevToolServer:         fc.DevToolServer,
+	}
+	if fc.ProvisionTimeout != "" {
+		d, err := time.ParseDuration(fc.ProvisionTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("config file provision_timeout: invalid duration %q: %w", fc.ProvisionTimeout, err)
+		}
+		c.ProvisionTimeout = d
 	}
 	if fc.IdleTimeout != "" {
 		d, err := time.ParseDuration(fc.IdleTimeout)
@@ -197,6 +206,8 @@ func configToFileConfig(cfg *Config) *fileConfig {
 		InstanceType:          cfg.InstanceType,
 		Region:                cfg.Region,
 		Image:                 cfg.Image,
+		BaseImage:             cfg.BaseImage,
+		AgentBinaryURL:        cfg.AgentBinaryURL,
 		MaxSessions:           cfg.MaxSessions,
 		MaxPersistentSessions: cfg.MaxPersistentSessions,
 		DBPath:                cfg.DBPath,
@@ -208,6 +219,9 @@ func configToFileConfig(cfg *Config) *fileConfig {
 	if cfg.MaxLifetime != 0 {
 		fc.MaxLifetime = cfg.MaxLifetime.String()
 	}
+	if cfg.ProvisionTimeout != 0 {
+		fc.ProvisionTimeout = cfg.ProvisionTimeout.String()
+	}
 	return fc
 }
 
@@ -217,15 +231,21 @@ func configToFileConfig(cfg *Config) *fileConfig {
 // input for a required key. The reader is injected so the wizard can be driven
 // in tests, though Load wires os.Stdin.
 //
-// For Component 2 the only required key is ECU_API_KEY; we additionally offer
-// to capture the public hostname since it is harmless and convenient, but never
-// require it.
+// The base required key is ECU_API_KEY; a production deployment on the hetzner
+// provider additionally requires ECU_HCLOUD_TOKEN, so the wizard augments the
+// passed-in base set with requiredFor (the same context-dependent computation
+// resolve uses) and prompts for the token when it is required and missing. We
+// additionally offer to capture the public hostname since it is harmless and
+// convenient, but never require it.
 func runWizardInto(cfg *Config, in io.Reader, out io.Writer, required []string) error {
 	scanner := bufio.NewScanner(in)
 	fmt.Fprintln(out, "ECU control plane — initial setup")
 	fmt.Fprintln(out, "Required configuration is missing; let's fill it in.")
 	fmt.Fprintln(out)
 
+	// Mirror resolve's context-dependent requirement so the wizard prompts for
+	// exactly what resolve would have flagged as missing.
+	required = requiredFor(cfg, required)
 	requiredSet := make(map[string]bool, len(required))
 	for _, k := range required {
 		requiredSet[k] = true
@@ -238,6 +258,17 @@ func runWizardInto(cfg *Config, in io.Reader, out io.Writer, required []string) 
 			return err
 		}
 		cfg.APIKey = val
+	}
+
+	// Hetzner Cloud API token (required in production on the hetzner provider).
+	// It is a secret, but reading it as a normal line keeps the wizard
+	// dependency-free; mirrors the API-key prompt.
+	if requiredSet["ECU_HCLOUD_TOKEN"] && cfg.HCloudToken == "" {
+		val, err := promptRequired(scanner, out, "Hetzner Cloud API token (ECU_HCLOUD_TOKEN)")
+		if err != nil {
+			return err
+		}
+		cfg.HCloudToken = val
 	}
 
 	// Public hostname (optional, prompted for convenience).

@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     height           INTEGER NOT NULL,
     created_at       TEXT NOT NULL,             -- RFC3339Nano
     last_activity_at TEXT NOT NULL,             -- RFC3339Nano
-    tunnel_token     TEXT NOT NULL DEFAULT ''   -- opaque per-session token an agent presents at /agent/connect (C3)
+    tunnel_token     TEXT NOT NULL DEFAULT '',  -- opaque per-session token an agent presents at /agent/connect (C3)
+    instance_id      TEXT NOT NULL DEFAULT ''   -- provider instance id backing this session, set on provisioning (C4); '' in dev mode
 );
 `
 
@@ -97,6 +98,11 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Same idempotent-migration pattern for the C4 instance_id column.
+	if err := ensureSessionInstanceID(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
@@ -106,6 +112,26 @@ func Open(dbPath string) (*Store, error) {
 // absent. modernc.org/sqlite supports both PRAGMA table_info and ALTER TABLE
 // ADD COLUMN.
 func ensureSessionTunnelToken(db *sql.DB) error {
+	return ensureSessionColumn(db, "tunnel_token",
+		`ALTER TABLE sessions ADD COLUMN tunnel_token TEXT NOT NULL DEFAULT '';`)
+}
+
+// ensureSessionInstanceID adds the sessions.instance_id column if a pre-C4
+// database is missing it. Same idempotent pattern as ensureSessionTunnelToken:
+// it inspects PRAGMA table_info(sessions) and only issues the ALTER when the
+// column is absent, so it is safe to run on every Open.
+func ensureSessionInstanceID(db *sql.DB) error {
+	return ensureSessionColumn(db, "instance_id",
+		`ALTER TABLE sessions ADD COLUMN instance_id TEXT NOT NULL DEFAULT '';`)
+}
+
+// ensureSessionColumn adds a column to the sessions table if it is absent. It
+// queries PRAGMA table_info(sessions); if column is already present it is a
+// no-op, otherwise it executes alterStmt. This is the idempotent-migration
+// primitive shared by the per-column ensure* helpers (CREATE TABLE IF NOT
+// EXISTS never alters an existing table, so a table created by an earlier
+// build lacks columns added later).
+func ensureSessionColumn(db *sql.DB, column, alterStmt string) error {
 	rows, err := db.Query(`PRAGMA table_info(sessions);`)
 	if err != nil {
 		return fmt.Errorf("store: inspecting sessions columns: %w", err)
@@ -122,15 +148,15 @@ func ensureSessionTunnelToken(db *sql.DB) error {
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
 			return fmt.Errorf("store: scanning sessions column info: %w", err)
 		}
-		if name == "tunnel_token" {
+		if name == column {
 			return rows.Err() // already present, nothing to migrate
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("store: iterating sessions columns: %w", err)
 	}
-	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN tunnel_token TEXT NOT NULL DEFAULT '';`); err != nil {
-		return fmt.Errorf("store: adding tunnel_token column: %w", err)
+	if _, err := db.Exec(alterStmt); err != nil {
+		return fmt.Errorf("store: adding %s column: %w", column, err)
 	}
 	return nil
 }

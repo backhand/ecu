@@ -118,6 +118,18 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Production path: kick off provisioning in the BACKGROUND and return
+	// `provisioning` immediately (HTTP 200), matching the documented API
+	// contract (the client polls GET /sessions/{id} until ready). The
+	// background goroutine creates the instance, waits for the agent to
+	// register, and tears the instance down on failure/timeout. It uses a
+	// context derived from context.Background() (NOT the request context, which
+	// ends when this handler returns). A nil provider means provisioning is not
+	// configured (e.g. C2/C3 builds): leave the session provisioning as before.
+	if s.devToolServer == "" && s.provider != nil {
+		go s.provisionSession(sess.ID, sess.TunnelToken)
+	}
+
 	resp := createSessionResponse{
 		SessionID:  sess.ID,
 		Status:     sess.Status,
@@ -155,7 +167,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		WatchURL: nil, // filled by C9
 	}
 	if sess.Status == statusError {
-		resp.Detail = "session provisioning is not available in this build"
+		resp.Detail = "session provisioning failed; the instance (if any) has been torn down"
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -166,7 +178,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 // making the operation idempotent-ish.
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_, found, err := s.store.GetSession(id)
+	sess, found, err := s.store.GetSession(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -175,9 +187,20 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown session")
 		return
 	}
+	// Teardown = destroy the instance (these are disposable; C8 will snapshot
+	// persistent ones instead). Best-effort and idempotent: DeleteInstance
+	// tolerates an already-destroyed instance, so a repeated DELETE is safe and
+	// a background provisioning waiter that also tears down does not conflict.
+	// In dev mode (no provider / no instance id) this is a no-op and we just
+	// mark terminated as before. We mark terminated FIRST so a concurrent
+	// provisioning waiter observes the terminated state and stops without
+	// resurrecting the session.
 	if err := s.store.UpdateSessionStatus(id, statusTerminated); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not terminate session")
 		return
+	}
+	if s.provider != nil && sess.InstanceID != "" {
+		s.teardownInstance(id, sess.InstanceID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": statusTerminated})
 }

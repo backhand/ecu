@@ -25,6 +25,12 @@ type Session struct {
 	// the tunnel_token migration. Never exposed to clients except via the
 	// dev-only ECU_DEV_EXPOSE_TUNNEL_TOKEN seam.
 	TunnelToken string
+
+	// InstanceID is the provider instance id backing this session, set once the
+	// control plane provisions an instance (C4). Empty for dev-mode sessions
+	// (no real instance) and for sessions created before the instance_id
+	// migration. DELETE uses it to destroy the instance via the Provider.
+	InstanceID string
 }
 
 // CreateSession inserts a new session row. created_at and last_activity_at are
@@ -37,12 +43,12 @@ func (s *Store) CreateSession(sess *Session) error {
 	sess.LastActivityAt = now
 	const q = `
 INSERT INTO sessions
-    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	_, err := s.db.Exec(q,
 		sess.ID, sess.Account, sess.Status, sess.ToolEndpoint, boolToInt(sess.Persistent),
 		sess.Width, sess.Height,
-		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken,
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken, sess.InstanceID,
 	)
 	if err != nil {
 		return fmt.Errorf("store: creating session: %w", err)
@@ -55,7 +61,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 // LookupKey.
 func (s *Store) GetSession(id string) (sess *Session, found bool, err error) {
 	const q = `
-SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token
+SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id
 FROM sessions WHERE id = ?;`
 	var (
 		out                      Session
@@ -65,7 +71,7 @@ FROM sessions WHERE id = ?;`
 	row := s.db.QueryRow(q, id)
 	switch err := row.Scan(
 		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
-		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken,
+		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID,
 	); {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil
@@ -87,6 +93,16 @@ FROM sessions WHERE id = ?;`
 func (s *Store) UpdateSessionStatus(id, status string) error {
 	if _, err := s.db.Exec(`UPDATE sessions SET status = ? WHERE id = ?;`, status, id); err != nil {
 		return fmt.Errorf("store: updating session status: %w", err)
+	}
+	return nil
+}
+
+// UpdateSessionInstanceID records the provider instance id backing a session
+// (set by the C4 provisioning flow once the instance is created). It is a
+// no-op (no error) if the id does not exist.
+func (s *Store) UpdateSessionInstanceID(id, instanceID string) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET instance_id = ? WHERE id = ?;`, instanceID, id); err != nil {
+		return fmt.Errorf("store: updating session instance id: %w", err)
 	}
 	return nil
 }
@@ -121,7 +137,7 @@ func (s *Store) SessionByTunnelToken(token string) (sess *Session, found bool, e
 		return nil, false, nil
 	}
 	const q = `
-SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token
+SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id
 FROM sessions WHERE tunnel_token = ? LIMIT 1;`
 	var (
 		out                      Session
@@ -131,7 +147,7 @@ FROM sessions WHERE tunnel_token = ? LIMIT 1;`
 	row := s.db.QueryRow(q, token)
 	switch err := row.Scan(
 		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
-		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken,
+		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID,
 	); {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil

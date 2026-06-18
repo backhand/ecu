@@ -21,6 +21,12 @@ import (
 	"github.com/backhand/ecu/internal/agent"
 	"github.com/backhand/ecu/internal/config"
 	"github.com/backhand/ecu/internal/controlplane"
+	"github.com/backhand/ecu/internal/provider"
+	// Blank import for its init(), which registers the "hetzner" provider with
+	// the provider factory. This is OUR package (not the hcloud-go SDK), so the
+	// SDK stays confined to internal/provider/hcloud. Importing it here makes
+	// provider.New("hetzner", ...) work without the factory importing any SDK.
+	_ "github.com/backhand/ecu/internal/provider/hcloud"
 	"github.com/backhand/ecu/internal/store"
 )
 
@@ -52,6 +58,36 @@ func main() {
 		log.Printf("ecu: fatal: %v", err)
 		os.Exit(1)
 	}
+}
+
+// defaultContainerImageRef is the cold-boot container image cloud-init runs
+// when ECU_IMAGE is unset. ECU_IMAGE is the pre-baked-image NAME field today
+// (C7); for a cold boot the instance pulls this container image ref. C7 will
+// govern pre-baking; for now this is a placeholder default.
+const defaultContainerImageRef = "ghcr.io/backhand/ecu-image:latest"
+
+// tunnelURL derives the publicly reachable tunnel ingress the instance agent
+// dials OUT to. With ECU_HOSTNAME set it is wss://<hostname>/agent/connect
+// (TLS, the production form — C10 wires the cert). Otherwise it falls back to
+// ws://<listen>/agent/connect for local/dev. NOTE: a real cloud instance needs
+// a PUBLICLY reachable URL; the ws://<listen> fallback only works when the
+// instance can reach that address (i.e. local/dev), which is why production
+// deployments must set ECU_HOSTNAME (C10).
+func tunnelURL(cfg *config.Config) string {
+	if cfg.Hostname != "" {
+		return "wss://" + cfg.Hostname + "/agent/connect"
+	}
+	return "ws://" + cfg.Listen + "/agent/connect"
+}
+
+// imageRef returns the container image cloud-init runs: cfg.Image if set, else
+// the placeholder default. (cfg.Image is the pre-baked-name field today; this
+// wires it through for the container image ref. C7 handles real pre-baking.)
+func imageRef(cfg *config.Config) string {
+	if cfg.Image != "" {
+		return cfg.Image
+	}
+	return defaultContainerImageRef
 }
 
 // agentToolServerDefault returns the tool-server URL default for the agent:
@@ -105,10 +141,41 @@ func runControlPlane() error {
 	// in production — it discloses the tunnel secret to API clients.
 	exposeTunnelToken := os.Getenv("ECU_DEV_EXPOSE_TUNNEL_TOKEN") == "1"
 
-	srv := controlplane.NewServer(st, cfg.DevToolServer,
+	opts := []controlplane.ServerOption{
 		controlplane.WithExposeTunnelToken(exposeTunnelToken),
 		controlplane.WithListenAddr(cfg.Listen),
-	)
+	}
+
+	// Production path only: construct the cloud Provider and the provisioning
+	// config. In dev-toolserver mode we provision nothing, so no provider is
+	// built or required.
+	if cfg.DevToolServer == "" {
+		prov, err := provider.New(cfg.Provider, provider.Config{
+			Token:         cfg.HCloudToken,
+			DefaultType:   cfg.InstanceType,
+			DefaultRegion: cfg.Region,
+		})
+		if err != nil {
+			return err
+		}
+		opts = append(opts,
+			controlplane.WithProvider(prov),
+			controlplane.WithProvisionConfig(controlplane.ProvisionConfig{
+				TunnelURL:        tunnelURL(cfg),
+				ImageRef:         imageRef(cfg),
+				AgentBinaryURL:   cfg.AgentBinaryURL,
+				InstanceType:     cfg.InstanceType,
+				Region:           cfg.Region,
+				BaseImage:        cfg.BaseImage,
+				ProvisionTimeout: cfg.ProvisionTimeout,
+				// WIDTH/HEIGHT default in the cloud-init renderer; left zero
+				// here so the renderer's 1280x800 default applies until they
+				// become configurable.
+			}),
+		)
+	}
+
+	srv := controlplane.NewServer(st, cfg.DevToolServer, opts...)
 	handler := srv.Handler()
 
 	log.Printf("ecu: control plane starting")

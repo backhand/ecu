@@ -6,21 +6,72 @@ import (
 	"time"
 )
 
-// TestResolveEnvPresent verifies that when the required key is present in the
+// TestResolveEnvPresent verifies that when the required keys are present in the
 // environment, resolve returns runWizard=false, no error, and the key is in the
-// resolved config.
+// resolved config. The default provider is hetzner and no dev tool-server is
+// set, so production rules apply: ECU_HCLOUD_TOKEN is required alongside
+// ECU_API_KEY.
 func TestResolveEnvPresent(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k_live_123"}
+	env := map[string]string{"ECU_API_KEY": "k_live_123", "ECU_HCLOUD_TOKEN": "hc_tok"}
 
 	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
 	if err != nil {
 		t.Fatalf("resolve returned error: %v", err)
 	}
 	if runWizard {
-		t.Fatalf("runWizard = true, want false when ECU_API_KEY is set")
+		t.Fatalf("runWizard = true, want false when required keys are set")
 	}
 	if cfg.APIKey != "k_live_123" {
 		t.Fatalf("cfg.APIKey = %q, want %q", cfg.APIKey, "k_live_123")
+	}
+}
+
+// TestResolveDevToolServerOnlyNeedsAPIKey verifies that the dev-toolserver path
+// provisions nothing, so only ECU_API_KEY is required even on the (default)
+// hetzner provider — no ECU_HCLOUD_TOKEN needed.
+func TestResolveDevToolServerOnlyNeedsAPIKey(t *testing.T) {
+	env := map[string]string{
+		"ECU_API_KEY":        "k",
+		"ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+	}
+	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (dev-toolserver mode must not require a provider token)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false: dev mode needs only ECU_API_KEY")
+	}
+}
+
+// TestResolveProductionRequiresHCloudToken verifies the context-dependent
+// requirement: production (no dev tool-server) on the hetzner provider requires
+// ECU_HCLOUD_TOKEN, and its absence fails fast with no TTY, naming the key.
+func TestResolveProductionRequiresHCloudToken(t *testing.T) {
+	env := map[string]string{"ECU_API_KEY": "k"} // hetzner default, no dev seam, no token
+
+	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err == nil {
+		t.Fatalf("resolve returned nil error, want fail-fast for missing ECU_HCLOUD_TOKEN")
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false on the fail-fast path")
+	}
+	if !strings.Contains(err.Error(), "ECU_HCLOUD_TOKEN") {
+		t.Fatalf("error %q does not name the missing key ECU_HCLOUD_TOKEN", err.Error())
+	}
+}
+
+// TestResolveNonHetznerProviderNoTokenRequired verifies that a non-hetzner
+// provider does not require ECU_HCLOUD_TOKEN (the token requirement is specific
+// to the hetzner provider).
+func TestResolveNonHetznerProviderNoTokenRequired(t *testing.T) {
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_PROVIDER": "someother"}
+	_, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (non-hetzner provider must not require ECU_HCLOUD_TOKEN)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false")
 	}
 }
 
@@ -58,11 +109,14 @@ func TestResolveMissingNoTTY(t *testing.T) {
 	}
 }
 
-// TestResolvePrecedenceEnvOverFile verifies env > file for ECU_LISTEN.
+// TestResolvePrecedenceEnvOverFile verifies env > file for ECU_LISTEN. The dev
+// tool-server is set so only ECU_API_KEY is required and we exercise
+// precedence, not the production token requirement.
 func TestResolvePrecedenceEnvOverFile(t *testing.T) {
 	env := map[string]string{
-		"ECU_API_KEY": "k", // satisfy required so we exercise precedence, not fail-fast
-		"ECU_LISTEN":  "0.0.0.0:9000",
+		"ECU_API_KEY":        "k", // satisfy required so we exercise precedence, not fail-fast
+		"ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+		"ECU_LISTEN":         "0.0.0.0:9000",
 	}
 	fileCfg := &Config{Listen: "127.0.0.1:7000"}
 
@@ -78,7 +132,7 @@ func TestResolvePrecedenceEnvOverFile(t *testing.T) {
 // TestResolvePrecedenceFileOverDefault verifies file > default for ECU_LISTEN
 // when env does not set it.
 func TestResolvePrecedenceFileOverDefault(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k"}
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000"}
 	fileCfg := &Config{Listen: "127.0.0.1:7000"}
 
 	cfg, _, err := resolve(env, fileCfg, false, requiredKeys)
@@ -93,7 +147,7 @@ func TestResolvePrecedenceFileOverDefault(t *testing.T) {
 // TestResolveDefaultWhenUnset verifies the built-in default for ECU_LISTEN is
 // used when neither env nor file supplies it.
 func TestResolveDefaultWhenUnset(t *testing.T) {
-	env := map[string]string{"ECU_API_KEY": "k"}
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000"}
 
 	cfg, _, err := resolve(env, nil, false, requiredKeys)
 	if err != nil {
@@ -108,10 +162,11 @@ func TestResolveDefaultWhenUnset(t *testing.T) {
 // that an invalid set value is reported as an error.
 func TestResolveParsesTypedSettings(t *testing.T) {
 	env := map[string]string{
-		"ECU_API_KEY":      "k",
-		"ECU_MAX_SESSIONS": "12",
-		"ECU_IDLE_TIMEOUT": "30m",
-		"ECU_MAX_LIFETIME": "2h",
+		"ECU_API_KEY":        "k",
+		"ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+		"ECU_MAX_SESSIONS":   "12",
+		"ECU_IDLE_TIMEOUT":   "30m",
+		"ECU_MAX_LIFETIME":   "2h",
 	}
 	cfg, _, err := resolve(env, nil, false, requiredKeys)
 	if err != nil {
@@ -128,7 +183,7 @@ func TestResolveParsesTypedSettings(t *testing.T) {
 	}
 
 	// A set-but-invalid duration must error.
-	bad := map[string]string{"ECU_API_KEY": "k", "ECU_IDLE_TIMEOUT": "not-a-duration"}
+	bad := map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000", "ECU_IDLE_TIMEOUT": "not-a-duration"}
 	if _, _, err := resolve(bad, nil, false, requiredKeys); err == nil {
 		t.Fatalf("resolve accepted an invalid ECU_IDLE_TIMEOUT, want error")
 	}
