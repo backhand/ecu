@@ -7,8 +7,15 @@ This client is intentionally readable end-to-end. It does three things:
   1. Wraps the ECU control-plane HTTP API (start/end session, actions).
   2. Reconstructs full screenshots from the control plane's diff protocol
      (nochange / diff / full), so callers always get a complete PNG.
-  3. Optionally downscales screenshots before they reach a vision model, since
-     model context — not bandwidth — is the dominant cost in a computer-use loop.
+  3. Asks the server to downscale + lossy-encode each frame at the source
+     (max_width / format / quality on the request), so the wire carries ~20-60
+     KB instead of a ~1 MB full-res PNG, and records the native/shown scale so
+     click/move/scroll coordinates translate back to native pixels. Both
+     bandwidth AND model-context cost are reduced, at the source.
+
+The reconstructed base is held as DECODED pixels in memory and only changed
+regions are pasted onto it between diffs — unchanged content is never re-encoded
+through the lossy codec, so repeated diffs don't accumulate compression damage.
 
 The control plane is the only thing this client talks to. It never learns the
 cloud instance's address; everything is proxied through the control plane over
@@ -67,11 +74,18 @@ class Session:
     # coordinates by this factor to recover native-space coordinates for the
     # server, keeping the coordinate space consistent with what the model saw.
     screenshot_scale: float = 1.0
-    # Cached last full frame (raw PNG bytes) + its frame_token, for diffing.
-    # The token is an integer on the wire; we keep the field permissive (it may
-    # arrive as int or str) and echo back whatever value we were given as `since`.
+    # Cached last full frame (PNG bytes) + its frame_token, for diffing and for
+    # the sidecar cache. The token is an integer on the wire; we keep the field
+    # permissive (it may arrive as int or str) and echo back whatever value we
+    # were given as `since`. These bytes are a *lossless* (PNG) snapshot of the
+    # reconstructed frame, so persisting/restoring the base never adds loss.
     _base_png: Optional[bytes] = field(default=None, repr=False)
     _base_token: Optional[Union[int, str]] = field(default=None, repr=False)
+    # In-memory decoded base (a PIL RGB Image), kept alongside the bytes so diff
+    # compositing pastes changed regions onto live pixels rather than re-decoding
+    # /re-encoding the whole frame each time. Never persisted (rebuilt on load
+    # from _base_png). Absent when Pillow isn't installed.
+    _base_image: object = field(default=None, repr=False, compare=False)
 
 
 class ECUClient:
@@ -225,28 +239,46 @@ class ECUClient:
         sess: Session,
         max_width: Optional[int] = 1280,
         force_full: bool = False,
+        format: str = "jpeg",
+        quality: int = 75,
     ) -> "Screenshot":
-        """Capture the screen and return a complete, ready-to-show PNG.
+        """Capture the screen and return a complete, ready-to-show frame.
 
-        Handles the control plane's diff protocol transparently:
+        The server does the downscale + lossy encode at the source, so the image
+        already arrives sized and compressed — this client only reconstructs and
+        records the coordinate scale. Handles the diff protocol transparently:
           - mode "nochange": the screen is identical to what we last held; we
             return the cached frame WITHOUT re-fetching a full image. This is
             the cheap path that makes 'did my click land yet?' polling almost
             free in both bytes and model tokens.
           - mode "diff": only changed regions came back; we composite them onto
-            the cached base frame to reconstruct the full image.
+            the in-memory decoded base to reconstruct the full image.
           - mode "full": a complete frame; we cache it as the new base.
 
-        max_width: if set, downscale the returned image so its width <= max_width
-                   before handing it to a model. Downscaling is the primary
-                   *token* lever; keep it modest enough to stay legible. When a
-                   downscale happens, the returned Screenshot's `scale` (and the
-                   Session's `screenshot_scale`) record native_width/shown_width
-                   so a later click/move/scroll can translate model coordinates
-                   back to native pixels (see ECUClient.click).
+        max_width: ask the server to downscale the frame so its width <=
+                   max_width before encoding. This is the primary bandwidth AND
+                   token lever; keep it modest enough to stay legible. The server
+                   reports native_width/native_height, from which we set
+                   `scale = native_width / shown_width` on both the Screenshot
+                   and the Session so a later click/move/scroll can translate
+                   model (shown-space) coordinates back to native pixels (see
+                   ECUClient.click). `None` means native resolution (no
+                   downscale).
+        format:    wire codec — "jpeg" (default, universal), "webp" (smallest),
+                   or "png" (lossless escape hatch for crisp text).
+        quality:   lossy quality 1..100 (ignored for png). ~75 is a good
+                   legibility/size tradeoff for UI screenshots.
         force_full: ignore the cache and demand a full frame.
         """
-        body = {"mode": "full" if force_full else "auto"}
+        body: dict = {
+            "mode": "full" if force_full else "auto",
+            "format": format,
+            "quality": quality,
+        }
+        # Omit max_width entirely for native res (the server treats absent as
+        # "native"); otherwise pass it so the server downscales at the source.
+        if max_width is not None:
+            body["max_width"] = max_width
         if sess._base_token is not None and not force_full:
             # Echo back whatever token value we hold (int or str) as `since`.
             body["since"] = sess._base_token
@@ -257,83 +289,124 @@ class ECUClient:
         if mode == "nochange":
             if sess._base_png is None:
                 # We claimed to hold a frame but don't — recover by forcing full.
-                return self.screenshot(sess, max_width=max_width, force_full=True)
-            png = sess._base_png
+                return self.screenshot(
+                    sess, max_width=max_width, force_full=True,
+                    format=format, quality=quality,
+                )
+            out_png = sess._base_png
             # Keep our cached token current (the server reports the live frame).
             if frame_token is not None:
                 sess._base_token = frame_token
 
         elif mode == "full":
-            png = base64.b64decode(data["image"])
-            sess._base_png = png
+            self._set_base(sess, base64.b64decode(data["image"]))
+            out_png = sess._base_png
             sess._base_token = frame_token
             sess.width = int(data.get("width", sess.width))
             sess.height = int(data.get("height", sess.height))
 
         elif mode == "diff":
-            png = self._apply_diff(sess, data)
-            sess._base_png = png
+            recovered = self._apply_diff(
+                sess, data, max_width=max_width, format=format, quality=quality
+            )
+            if recovered is not None:
+                # We had no base to composite onto and re-fetched a full frame;
+                # that Screenshot is already complete and correctly stamped.
+                return recovered
+            out_png = sess._base_png
             sess._base_token = frame_token
+            sess.width = int(data.get("width", sess.width))
+            sess.height = int(data.get("height", sess.height))
 
         else:
             raise ECUError(f"unexpected screenshot mode: {mode!r}")
 
-        # native_width is the reconstructed full-frame width *before* downscale;
-        # shown_width (w) is what we actually return. Compute the scale the
-        # front-ends need to translate model coordinates back to native pixels.
-        native_width = _png_width(png)
-        out_png, w, h = self._maybe_downscale(png, max_width)
-        if max_width is None or not native_width or native_width <= max_width or not w:
-            scale = 1.0
-        else:
-            scale = native_width / w
+        # The image already arrives at the shown size. The server reports the
+        # native capture size; the scale the front-ends need to translate model
+        # coordinates back to native pixels is native_width / shown_width.
+        shown_w = int(data.get("width") or _png_width(out_png))
+        shown_h = int(data.get("height") or _png_height(out_png))
+        native_w = int(data.get("native_width") or shown_w)
+        scale = (native_w / shown_w) if shown_w else 1.0
         sess.screenshot_scale = scale
         return Screenshot(
             png=out_png,
-            width=w,
-            height=h,
+            width=shown_w,
+            height=shown_h,
             mode=mode or "full",
             scale=scale,
             frame_token=sess._base_token,
         )
 
-    def _apply_diff(self, sess: Session, data: dict) -> bytes:
+    def _set_base(self, sess: Session, image_bytes: bytes) -> None:
+        """Adopt a server full-frame as the new base.
+
+        The server frame may be JPEG/WebP/PNG. We decode it once to pixels (the
+        in-memory base future diffs paste onto) and normalize the cached/returned
+        bytes to *PNG* so ``Screenshot.png`` has a single, correctly-labeled
+        format regardless of the wire codec, and so the sidecar ``.png`` cache is
+        genuinely a PNG. This is a single lossless re-encode of the frame the
+        server already sent — it adds no compression damage and never repeats on
+        unchanged content. Without Pillow we cannot decode, so we keep the raw
+        bytes as-is (full-frame-only, no diffing) — see _HAVE_PIL guards."""
+        if _HAVE_PIL:
+            base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            sess._base_image = base
+            buf = io.BytesIO()
+            base.save(buf, format="PNG")
+            sess._base_png = buf.getvalue()
+        else:
+            sess._base_image = None
+            sess._base_png = image_bytes
+
+    def _apply_diff(
+        self,
+        sess: Session,
+        data: dict,
+        max_width: Optional[int],
+        format: str,
+        quality: int,
+    ) -> Optional["Screenshot"]:
+        """Composite a ``diff`` onto the in-memory decoded base, then refresh the
+        cached PNG bytes from those pixels.
+
+        Only the changed regions are pasted; the rest of the frame keeps its
+        previously-decoded pixels and is never run back through the lossy codec,
+        so repeated diffs do not accumulate compression damage. The cached bytes
+        are re-encoded as *PNG* (lossless), so the persisted/returned base adds
+        no further loss on top of what the server already sent.
+
+        Returns ``None`` on the normal path. If there is no base to composite
+        onto (we lost it), it re-fetches a full frame and returns that complete
+        Screenshot so the caller can hand it back directly."""
         if not _HAVE_PIL:
             raise ECUError(
                 "screenshot diff reconstruction needs Pillow. "
                 "Install it (`pip install Pillow`) or the control plane can be "
                 "asked for full frames only."
             )
-        if sess._base_png is None:
-            # No base to composite onto — force a full frame instead.
-            full = self.screenshot(sess, max_width=None, force_full=True)
-            return full.png
-        base = Image.open(io.BytesIO(sess._base_png)).convert("RGB")
+        base = sess._base_image
+        if base is None:
+            if sess._base_png is None:
+                # No base to composite onto — force a full frame instead, with
+                # the SAME encoding so the recovered frame matches the request.
+                return self.screenshot(
+                    sess, max_width=max_width, force_full=True,
+                    format=format, quality=quality,
+                )
+            # Bytes but no decoded image (e.g. freshly hydrated from cache):
+            # decode once, then composite onto those pixels.
+            base = Image.open(io.BytesIO(sess._base_png)).convert("RGB")
         for region in data.get("regions", []):
-            patch = Image.open(io.BytesIO(base64.b64decode(region["image"]))).convert("RGB")
+            patch = Image.open(
+                io.BytesIO(base64.b64decode(region["image"]))
+            ).convert("RGB")
             base.paste(patch, (int(region["x"]), int(region["y"])))
+        sess._base_image = base
         buf = io.BytesIO()
         base.save(buf, format="PNG")
-        return buf.getvalue()
-
-    def _maybe_downscale(self, png: bytes, max_width: Optional[int]):
-        if not max_width:
-            if _HAVE_PIL:
-                im = Image.open(io.BytesIO(png))
-                return png, im.width, im.height
-            return png, 0, 0
-        if not _HAVE_PIL:
-            # Can't measure/resize without Pillow; return as-is.
-            return png, 0, 0
-        im = Image.open(io.BytesIO(png)).convert("RGB")
-        if im.width <= max_width:
-            return png, im.width, im.height
-        ratio = max_width / im.width
-        new_size = (max_width, max(1, round(im.height * ratio)))
-        im = im.resize(new_size, Image.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        return buf.getvalue(), im.width, im.height
+        sess._base_png = buf.getvalue()
+        return None
 
 
 @dataclass
@@ -373,10 +446,17 @@ def _scale_xy(x, y, scale: float):
 
 
 def _png_width(png: bytes) -> int:
-    """Width in pixels of a PNG, or 0 if it can't be measured (no Pillow)."""
+    """Width in pixels of an encoded image, or 0 if unmeasurable (no Pillow)."""
     if not _HAVE_PIL:
         return 0
     return Image.open(io.BytesIO(png)).width
+
+
+def _png_height(png: bytes) -> int:
+    """Height in pixels of an encoded image, or 0 if unmeasurable (no Pillow)."""
+    if not _HAVE_PIL:
+        return 0
+    return Image.open(io.BytesIO(png)).height
 
 
 # ---- CLI sidecar cache ---------------------------------------------------

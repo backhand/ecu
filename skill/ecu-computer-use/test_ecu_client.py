@@ -64,6 +64,14 @@ def _png(width: int, height: int, color) -> bytes:
     return buf.getvalue()
 
 
+def _jpeg(width: int, height: int, color, quality: int = 75) -> bytes:
+    """Build a solid-color RGB JPEG (models the server's lossy wire encoding)."""
+    im = PILImage.new("RGB", (width, height), color)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -136,6 +144,75 @@ class DiffReconstructionTest(unittest.TestCase):
         self.assertEqual(out.getpixel((60, 30)), (0, 0, 0))
         self.assertEqual(out.getpixel((0, 0)), (0, 0, 0))
 
+    def test_lossy_diff_round_trip_with_native_dims(self):
+        """A lossy (JPEG) full frame + lossy diff region reconstructs coherently,
+        the returned image is normalized to PNG, and native dims drive scale.
+
+        Models the server-side-downscale protocol: a 1280-native desktop shown
+        at width 640, JPEG-encoded. Reconstruction must place the patch in the
+        right spot (allowing for JPEG noise) and leave the rest near-background.
+        """
+        base_jpg = _jpeg(640, 400, (20, 20, 20))
+        patch_jpg = _jpeg(40, 30, (200, 50, 50))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(base_jpg)},
+            {"mode": "diff", "frame_token": 2, "base_token": 1,
+             "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800,
+             "regions": [{"x": 100, "y": 80, "w": 40, "h": 30,
+                          "image": _b64(patch_jpg)}]},
+        ])
+        sess = Session(session_id="s1", status="ready")
+
+        full = client.screenshot(sess, max_width=640)
+        self.assertEqual(full.mode, "full")
+        self.assertAlmostEqual(full.scale, 2.0)        # 1280 / 640
+        # Returned bytes are normalized to PNG regardless of the JPEG wire format.
+        self.assertEqual(PILImage.open(io.BytesIO(full.png)).format, "PNG")
+
+        shot = client.screenshot(sess, max_width=640)
+        self.assertEqual(shot.mode, "diff")
+        self.assertAlmostEqual(shot.scale, 2.0)
+        out = PILImage.open(io.BytesIO(shot.png)).convert("RGB")
+        # Center of the patch is reddish (lossy, so compare with tolerance).
+        r, g, b = out.getpixel((120, 95))
+        self.assertGreater(r, 150)
+        self.assertLess(g, 110)
+        # A pixel well outside the patch stays near the dark background.
+        r2, _, _ = out.getpixel((10, 10))
+        self.assertLess(r2, 80)
+
+    def test_diffs_do_not_accumulate_lossy_damage(self):
+        """Cumulative-loss guard: unchanged content is held as decoded pixels and
+        only changed regions are pasted, so an UNCHANGED corner is byte-identical
+        across many successive diffs (never re-run through the lossy codec)."""
+        base_jpg = _jpeg(128, 96, (30, 60, 90))
+        # Each diff touches only a small patch far from the sampled corner.
+        diffs = []
+        for i in range(6):
+            patch = _jpeg(16, 16, (10 * i, 20, 30))
+            diffs.append(
+                {"mode": "diff", "frame_token": i + 2, "base_token": i + 1,
+                 "width": 128, "height": 96,
+                 "regions": [{"x": 80, "y": 60, "w": 16, "h": 16,
+                              "image": _b64(patch)}]}
+            )
+        client = ScriptedClient(
+            [{"mode": "full", "frame_token": 1, "width": 128, "height": 96,
+              "image": _b64(base_jpg)}] + diffs
+        )
+        sess = Session(session_id="s1", status="ready")
+
+        first = client.screenshot(sess, max_width=None)
+        corner0 = PILImage.open(io.BytesIO(first.png)).convert("RGB").getpixel((5, 5))
+        for _ in range(6):
+            shot = client.screenshot(sess, max_width=None)
+            self.assertEqual(shot.mode, "diff")
+            corner = PILImage.open(io.BytesIO(shot.png)).convert("RGB").getpixel((5, 5))
+            # Pixel-exact: the corner never degrades no matter how many diffs.
+            self.assertEqual(corner, corner0)
+
 
 # --------------------------------------------------------------------------
 # Fix #4 (client side): nochange returns cached frame without refetch
@@ -175,13 +252,19 @@ class NoChangeTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class CoordinateScalingTest(unittest.TestCase):
+    # Under the server-side-downscale protocol the SERVER returns the already
+    # downscaled image and reports both the shown `width`/`height` and the real
+    # `native_width`/`native_height`. The client derives scale = native/shown
+    # from the response (it no longer downscales locally), so these fixtures
+    # model a 1280-native desktop shown at max_width=640 -> shown width 640.
+
     def test_screenshot_records_scale_factor(self):
-        """A 1280-wide native frame shown at max_width=640 yields scale 2.0 on
-        both the Screenshot and the Session."""
-        native = _png(1280, 800, (5, 5, 5))
+        """A 1280-native frame shown at max_width=640 (server-downscaled to a
+        640-wide image) yields scale 2.0 on both the Screenshot and Session."""
+        shown = _png(640, 400, (5, 5, 5))   # server already downscaled
         client = ScriptedClient([
-            {"mode": "full", "frame_token": 1, "width": 1280, "height": 800,
-             "image": _b64(native)},
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
         ])
         sess = Session(session_id="s1", status="ready")
         shot = client.screenshot(sess, max_width=640)
@@ -190,12 +273,27 @@ class CoordinateScalingTest(unittest.TestCase):
         self.assertAlmostEqual(shot.scale, 2.0)
         self.assertAlmostEqual(sess.screenshot_scale, 2.0)
 
+    def test_screenshot_forwards_encoding_params(self):
+        """max_width/format/quality are sent on the screenshot REQUEST so the
+        server downscales+encodes at the source (not the client)."""
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=640, format="webp", quality=60)
+        body = client.calls[-1]["body"]
+        self.assertEqual(body["max_width"], 640)
+        self.assertEqual(body["format"], "webp")
+        self.assertEqual(body["quality"], 60)
+
     def test_no_downscale_keeps_scale_one(self):
-        """When the native frame is already <= max_width, scale stays 1.0."""
-        native = _png(800, 600, (5, 5, 5))
+        """When the server reports native == shown (no downscale), scale=1.0."""
+        shown = _png(800, 600, (5, 5, 5))
         client = ScriptedClient([
             {"mode": "full", "frame_token": 1, "width": 800, "height": 600,
-             "image": _b64(native)},
+             "native_width": 800, "native_height": 600, "image": _b64(shown)},
         ])
         sess = Session(session_id="s1", status="ready")
         shot = client.screenshot(sess, max_width=1280)
@@ -203,13 +301,13 @@ class CoordinateScalingTest(unittest.TestCase):
         self.assertAlmostEqual(sess.screenshot_scale, 1.0)
 
     def test_coordinate_scaling_after_downscale(self):
-        """The core of Fix #3: after a downscaled screenshot (scale 2.0), a click
-        at SHOWN coords (x, y) must send NATIVE coords (2x, 2y) to /click — and
-        scroll deltas (dx, dy) must NOT be scaled."""
-        native = _png(1280, 800, (5, 5, 5))
+        """The core of the coordinate fix: after a downscaled screenshot (scale
+        2.0), a click at SHOWN coords (x, y) must send NATIVE coords (2x, 2y) to
+        /click — and scroll deltas (dx, dy) must NOT be scaled."""
+        shown = _png(640, 400, (5, 5, 5))
         client = ScriptedClient([
-            {"mode": "full", "frame_token": 1, "width": 1280, "height": 800,
-             "image": _b64(native)},
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
             {"ok": True},   # click
             {"ok": True},   # move
             {"ok": True},   # scroll
@@ -365,7 +463,8 @@ class _FakeClient:
         self.shots = []            # queued Screenshot objects to return
         self.action_calls = []     # (name, args, kwargs)
 
-    def screenshot(self, sess, max_width=1280, force_full=False):
+    def screenshot(self, sess, max_width=1280, force_full=False,
+                   format="jpeg", quality=75):
         shot = self.shots.pop(0)
         # Mirror the real client: stamp the session scale so _get() reflects it.
         sess.screenshot_scale = shot.scale

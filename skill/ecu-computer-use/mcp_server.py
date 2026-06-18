@@ -16,8 +16,9 @@ screenshot diff compositing / downscaling):
 
 Design notes:
   * Screenshots are returned as MCP image content, already reconstructed from
-    the control plane's diff protocol and downscaled for model legibility. The
-    model never sees a diff — it always gets a complete still.
+    the control plane's diff protocol. The frame is downscaled AND lossy-encoded
+    at the source (server-side) for both wire and token efficiency, then handed
+    to the model as a complete PNG still — the model never sees a diff.
   * `screenshot` is an explicit tool, NOT auto-attached to every action result.
     This keeps image tokens bounded. Take a screenshot when you need to look.
   * When polling after an action ("did it land yet?"), the control plane returns

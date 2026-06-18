@@ -117,12 +117,12 @@ persistent shell session); background long-running things yourself
 A tool-level failure (e.g. the X display isn't up) comes back as the tool
 server's `{ "ok": false, "error": "..." }` with a `5xx` status, copied through.
 
-## Screenshot protocol (diff-aware)
+## Screenshot protocol (diff-aware, downscaled + lossy at the source)
 
 ### POST /sessions/{session_id}/screenshot
 Request:
 ```json
-{ "since": 12, "mode": "auto" }
+{ "since": 12, "mode": "auto", "max_width": 1280, "format": "jpeg", "quality": 75 }
 ```
 - `since` (integer, optional): the `frame_token` the caller currently holds.
   **Frame tokens are integers** (a monotonic per-instance counter), not opaque
@@ -130,8 +130,25 @@ Request:
 - `mode` (string, optional): `auto` (default — the server decides
   full/diff/nochange) or `full` (force a complete frame). Omitting it is treated
   as `auto`.
+- `max_width` (integer, optional): the server **downscales the captured frame to
+  this width** before tiling/diffing/encoding, so the wire carries the shown
+  (smaller) image and never the full-res original. Omit it (or send the native
+  width) for no downscale. **A `max_width` that differs from the size of the
+  base the server currently holds forces a `full`** (the diff base is the
+  downscaled frame, so a different shown size can't be tile-diffed).
+- `format` (string, optional): wire codec — `jpeg` (default, universal), `webp`
+  (smallest, ~25–35% under JPEG where the decoder supports it), or `png`
+  (lossless escape hatch for crisp text — larger). Applied to the full frame
+  **and** every diff region.
+- `quality` (integer 1–100, optional): lossy quality (default `75`; ignored for
+  `png`). ~75 balances legibility and size for UI screenshots.
 
-Three response shapes, distinguished by `mode`:
+The defaults make a bare `{}` request return a lossy JPEG full-res frame
+(~20–60 KB) instead of the old ~1 MB PNG.
+
+Three response shapes, distinguished by `mode`. All non-`nochange` shapes carry
+the shown `width`/`height` (the downscaled size the images are in) **and** the
+real captured `native_width`/`native_height` (see "Coordinates" below):
 
 **No change** — the screen is pixel-identical to `since`:
 ```json
@@ -142,37 +159,52 @@ path — use it freely when polling. (On the MCP front-end this surfaces as a
 short text note instead of re-sending the image; the CLI re-saves its cached
 frame.)
 
-**Diff** — only changed regions are returned:
+**Diff** — only changed regions are returned, in the **shown** (downscaled)
+pixel space:
 ```json
 { "mode": "diff", "frame_token": 13, "base_token": 12,
-  "width": 1280, "height": 800,
-  "regions": [ { "x":100, "y":100, "w":120, "h":90, "image":"<base64 png>" } ] }
+  "width": 1280, "height": 800, "native_width": 1280, "native_height": 800,
+  "regions": [ { "x":100, "y":100, "w":120, "h":90, "image":"<base64 image>" } ] }
 ```
-The caller composites each region (a small PNG) onto its cached base frame at
-`(x,y)` to reconstruct the complete image. `base_token` is the frame the diff is
-against; it equals the `since` the caller sent. If a caller's base ever fails to
-match, request `mode:"full"`.
+The caller composites each region (a small lossy image in the requested
+`format`) onto its cached base frame at `(x,y)` to reconstruct the complete
+image. `base_token` is the frame the diff is against; it equals the `since` the
+caller sent. If a caller's base ever fails to match, request `mode:"full"`.
 
 **Full** — a complete frame (first capture, forced `mode:"full"`, a `since` that
-doesn't match the server's current base, a resolution change, or when a diff
-would be ≥ a full frame, e.g. a page transition):
+doesn't match the server's current base, a resolution **or `max_width`** change,
+or when a diff would be ≥ a full frame, e.g. a page transition):
 ```json
-{ "mode": "full", "frame_token": 13, "width":1280, "height":800,
-  "image":"<base64 png>" }
+{ "mode": "full", "frame_token": 13,
+  "width":1280, "height":800, "native_width":1280, "native_height":800,
+  "image":"<base64 image>" }
 ```
 
 How the server decides (single base frame per instance): a forced full / first
-frame / `since` mismatch → `full`; otherwise it compares the new frame against
-the base on a 64px tile grid — no tile changed → `nochange`; ≥ ~90% of tiles
-changed, or the diff region PNGs together weigh ≥ the full-frame PNG → `full`;
-else → `diff` of the changed regions.
+frame / `since` mismatch / `max_width` differing from the held base's width →
+`full`; otherwise it downscales the new frame to `max_width` and compares it
+against the (also downscaled) base on a 64px tile grid — no tile changed →
+`nochange`; ≥ ~90% of tiles changed, or the diff region images together weigh ≥
+the full-frame image → `full`; else → `diff` of the changed regions. The
+full-fallback byte rule is evaluated on the **lossy** sizes (regions and full
+encoded with the same `format`/`quality`), so it stays apples-to-apples.
+
+**Coordinates.** Region coordinates and the `width`/`height` are in the **shown
+image's pixel space** (post-downscale) — exactly the space the client
+composites and the model clicks in. `native_width`/`native_height` report the
+real captured desktop size. The client records `scale = native_width /
+width` and multiplies model-supplied (shown-space) click/move/scroll anchors by
+it before sending them to the action endpoints, so a click at `max_width=640` on
+a 1280-native desktop sends `(2x, 2y)`. Scroll **deltas** (`dx`/`dy`) are scroll
+clicks, not coordinates, and are never scaled.
 
 Important: the **client always reconstructs a full frame before showing it to a
-model** — a vision model cannot apply a diff. Diffing is purely a
-wire/latency/token optimization. The client then optionally **downscales** the
-reconstructed frame to `max_width` (the main lever for reducing model token
-cost) and records the scale factor so subsequent click/move/scroll coordinates,
-given in the downscaled space, are translated back to native pixels.
+model** — a vision model cannot apply a diff. The reconstructed base is held as
+**decoded pixels in memory**; only changed regions are pasted onto it between
+diffs, so unchanged content is never re-run through the lossy codec and repeated
+diffs do not accumulate compression damage. Diffing + downscaling + lossy
+encoding are purely wire/latency/token optimizations; the model only ever sees a
+complete still.
 
 ## Live watch (human oversight)
 

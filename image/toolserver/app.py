@@ -7,12 +7,20 @@ GUI action is forwarded to the demo's ``ComputerTool`` (xdotool/scrot under
 the hood). Only ``/exec`` and the ``/screenshot`` framing add local logic.
 
 Component 1 of ECU. The screenshot diff protocol (``nochange``/``diff``) is
-Component 6: ``/screenshot`` keeps the last frame (PNG bytes + decoded pixels)
-and a monotonic ``frame_token``, and against the caller's ``since`` token it
-returns ``nochange`` (pixel-identical), ``diff`` (only changed tile regions),
-or ``full`` (first frame / forced / since mismatch / diff-bigger-than-full).
-The client composites diff regions onto its cached base to reconstruct the
-full frame; the model never sees a diff (see skill/ecu_client.py).
+Component 6: ``/screenshot`` keeps the last frame (encoded bytes + decoded
+pixels) and a monotonic ``frame_token``, and against the caller's ``since``
+token it returns ``nochange`` (pixel-identical), ``diff`` (only changed tile
+regions), or ``full`` (first frame / forced / since mismatch / diff-bigger-
+than-full). The client composites diff regions onto its cached base to
+reconstruct the full frame; the model never sees a diff (see skill/ecu_client.py).
+
+Wire efficiency (protocol #1+#2): the captured frame is downscaled to the
+caller's ``max_width`` and lossy-encoded (JPEG/WebP, PNG escape hatch) *at the
+source*, so the wire carries ~20-60 KB instead of a ~1 MB full-res PNG. The
+diff base the server holds is the *downscaled* frame, so region coordinates are
+already in the shown space the client composites in. The response reports the
+real captured size as ``native_width``/``native_height`` alongside the shown
+``width``/``height`` so the client can translate clicks back to native pixels.
 
 Security note: this binds to 0.0.0.0 *inside the container* on purpose. The
 "localhost-only" property is enforced by how the instance publishes the port
@@ -83,6 +91,21 @@ TILE_SIZE = int(os.getenv("ECU_DIFF_TILE") or 64)
 #    change / page transition falls back to full" deterministic. Either trips it.
 FULL_COVERAGE = float(os.getenv("ECU_DIFF_FULL_COVERAGE") or 0.9)
 
+# Wire-encoding defaults (protocol #1+#2). The full frame and every diff region
+# are downscaled to ``max_width`` and lossy-encoded before they hit the wire.
+#  * DEFAULT_MAX_WIDTH = WIDTH means "no downscale by default" (a no-op): callers
+#    opt into a smaller frame by passing a smaller max_width.
+#  * jpeg is the universal default; webp compresses ~25-35% better where the
+#    decoder supports it; png is a crisp-text escape hatch (lossless, larger).
+#  * quality ~75 is a good legibility/size tradeoff for UI screenshots.
+DEFAULT_MAX_WIDTH = int(os.getenv("ECU_SHOT_MAX_WIDTH") or WIDTH)
+DEFAULT_FORMAT = (os.getenv("ECU_SHOT_FORMAT") or "jpeg").lower()
+DEFAULT_QUALITY = int(os.getenv("ECU_SHOT_QUALITY") or 75)
+
+# Map a request ``format`` to (Pillow format, response content tag). PNG is
+# lossless and ignores ``quality``; jpeg/webp are lossy.
+_FORMATS: dict[str, str] = {"jpeg": "JPEG", "webp": "WEBP", "png": "PNG"}
+
 app = FastAPI(title="ECU tool server", version="1")
 
 
@@ -103,38 +126,43 @@ _computer._scaling_enabled = False
 
 
 class _FrameState:
-    """The instance's single base frame: PNG bytes, decoded pixels, and token.
+    """The instance's single base frame: encoded bytes, decoded pixels, token.
 
     Single-tenant per instance, so this is the one frame the brief refers to
-    ("per session = the one frame"). The diff protocol compares a freshly
-    captured frame against ``pixels`` (an HxWx3 uint8 numpy array) to emit
-    ``nochange``/``diff``, and advances ``token`` only when the base actually
-    moves (full/diff), never on ``nochange``. All access is lock-guarded.
+    ("per session = the one frame"). The base now holds the *downscaled* frame:
+    ``pixels`` (an HxWx3 uint8 numpy array in the shown space) is what the diff
+    tiling runs against, and ``base_width`` records the shown width so a caller
+    asking for a *different* ``max_width`` invalidates the base (different base
+    size -> we must return a full frame). The diff protocol advances ``token``
+    only when the base actually moves (full/diff), never on ``nochange``. All
+    access is lock-guarded.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._token = 0
-        self._png: bytes | None = None
+        self._image: bytes | None = None
         self._pixels: np.ndarray | None = None
+        self._base_width: int = 0
 
-    def snapshot(self) -> tuple[int, bytes | None, np.ndarray | None]:
-        """Atomically read the current base (token, png, pixels)."""
+    def snapshot(self) -> tuple[int, bytes | None, np.ndarray | None, int]:
+        """Atomically read the current base (token, image, pixels, base_width)."""
         with self._lock:
-            return self._token, self._png, self._pixels
+            return self._token, self._image, self._pixels, self._base_width
 
-    def set(self, png: bytes, pixels: np.ndarray) -> int:
-        """Replace the base with a new frame, advance the token, return it."""
+    def set(self, image: bytes, pixels: np.ndarray) -> int:
+        """Replace the base with a new (downscaled) frame, advance the token."""
         with self._lock:
             self._token += 1
-            self._png = png
+            self._image = image
             self._pixels = pixels
+            self._base_width = int(pixels.shape[1])
             return self._token
 
     @property
-    def last_png(self) -> bytes | None:
+    def last_image(self) -> bytes | None:
         with self._lock:
-            return self._png
+            return self._image
 
     @property
     def token(self) -> int:
@@ -184,7 +212,7 @@ async def _capture_png() -> bytes:
 
 
 def _decode_rgb(png: bytes) -> np.ndarray:
-    """Decode a PNG to a contiguous HxWx3 uint8 RGB array.
+    """Decode an encoded image (any Pillow format) to an HxWx3 uint8 RGB array.
 
     RGB (not RGBA) so the per-tile comparison and the region crops match what
     the client reconstructs with (``Image.open(...).convert("RGB")``).
@@ -193,12 +221,59 @@ def _decode_rgb(png: bytes) -> np.ndarray:
     return np.asarray(im, dtype=np.uint8)
 
 
-def _encode_crop_png(pixels: np.ndarray, x: int, y: int, w: int, h: int) -> bytes:
-    """Crop (x,y,w,h) out of an RGB pixel array and encode it as a PNG."""
-    crop = pixels[y : y + h, x : x + w]
+def _normalize_encoding(
+    fmt: str | None, quality: int | None, max_width: int | None
+) -> tuple[str, int, int]:
+    """Clamp/resolve the request's (format, quality, max_width) to safe values.
+
+    Unknown/absent format -> the server default; quality clamped to 1..100;
+    max_width to at least 1 (a missing max_width means "native", i.e. WIDTH).
+    """
+    pil_fmt = _FORMATS.get((fmt or DEFAULT_FORMAT).lower(), _FORMATS[DEFAULT_FORMAT])
+    q = DEFAULT_QUALITY if quality is None else int(quality)
+    q = max(1, min(100, q))
+    mw = DEFAULT_MAX_WIDTH if max_width is None else int(max_width)
+    mw = max(1, mw)
+    return pil_fmt, q, mw
+
+
+def _encode(im: Image.Image, pil_fmt: str, quality: int) -> bytes:
+    """Encode a PIL RGB image in ``pil_fmt`` (PNG lossless; jpeg/webp lossy)."""
     buf = io.BytesIO()
-    Image.fromarray(crop, mode="RGB").save(buf, format="PNG")
+    if pil_fmt == "PNG":
+        im.save(buf, format="PNG")
+    else:
+        # optimize=False keeps JPEG encoding cheap; quality drives size/fidelity.
+        im.save(buf, format=pil_fmt, quality=quality)
     return buf.getvalue()
+
+
+def _encode_pixels(pixels: np.ndarray, pil_fmt: str, quality: int) -> bytes:
+    """Encode a full HxWx3 RGB pixel array in the chosen wire format."""
+    return _encode(Image.fromarray(pixels, mode="RGB"), pil_fmt, quality)
+
+
+def _encode_crop(
+    pixels: np.ndarray, x: int, y: int, w: int, h: int, pil_fmt: str, quality: int
+) -> bytes:
+    """Crop (x,y,w,h) out of an RGB pixel array and encode it in ``pil_fmt``."""
+    crop = pixels[y : y + h, x : x + w]
+    return _encode(Image.fromarray(crop, mode="RGB"), pil_fmt, quality)
+
+
+def _downscale_to_width(pixels: np.ndarray, max_width: int) -> np.ndarray:
+    """Downscale an RGB pixel array so its width is ``max_width`` (LANCZOS).
+
+    A no-op when the frame is already <= max_width (never upscales). Height is
+    scaled proportionally and clamped to >= 1. Returns a fresh contiguous array
+    in the shown space; all diffing/cropping then happens at this size.
+    """
+    h, w = pixels.shape[:2]
+    if w <= max_width:
+        return pixels
+    new_h = max(1, round(h * (max_width / w)))
+    im = Image.fromarray(pixels, mode="RGB").resize((max_width, new_h), Image.LANCZOS)
+    return np.asarray(im, dtype=np.uint8)
 
 
 def _changed_tile_grid(base: np.ndarray, cur: np.ndarray, tile: int) -> np.ndarray:
@@ -288,6 +363,11 @@ def _err(message: str, status: int = 500) -> JSONResponse:
 class ScreenshotBody(BaseModel):
     since: int | None = None
     mode: Literal["full", "auto"] | None = None
+    # Wire-encoding controls (protocol #1+#2). All optional; omitted -> server
+    # defaults (max_width=native, jpeg, q75 -> a no-op-width lossy frame).
+    max_width: int | None = Field(default=None, gt=0)
+    format: Literal["jpeg", "webp", "png"] | None = None
+    quality: int | None = Field(default=None, ge=1, le=100)
 
 
 class ClickBody(BaseModel):
@@ -347,37 +427,56 @@ async def healthz() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-def _full_response(png: bytes, pixels: np.ndarray) -> dict:
-    """Set ``png``/``pixels`` as the new base and build a ``full`` payload."""
-    token = _frames.set(png, pixels)
+def _full_response(
+    pixels: np.ndarray,
+    native_w: int,
+    native_h: int,
+    pil_fmt: str,
+    quality: int,
+) -> dict:
+    """Encode ``pixels`` (the downscaled, shown-space frame), set it as the new
+    base, and build a ``full`` payload.
+
+    ``pixels`` is what the client composites against, so the base we hold is the
+    downscaled frame. We additionally report the *native* capture size so the
+    client can scale model (shown-space) coordinates back to native pixels.
+    """
+    image = _encode_pixels(pixels, pil_fmt, quality)
+    token = _frames.set(image, pixels)
     h, w = pixels.shape[:2]
     return {
         "mode": "full",
         "frame_token": token,
-        "image": base64.b64encode(png).decode(),
+        "image": base64.b64encode(image).decode(),
         "width": w,
         "height": h,
+        "native_width": native_w,
+        "native_height": native_h,
     }
 
 
 def _diff_or_full(
-    png: bytes,
     pixels: np.ndarray,
     base_token: int,
     base_pixels: np.ndarray,
+    native_w: int,
+    native_h: int,
+    pil_fmt: str,
+    quality: int,
 ) -> dict:
     """Compute the diff response shape against the held base (sync/CPU-bound).
 
+    ``pixels`` and ``base_pixels`` are both in the *shown* (downscaled) space.
     Returns ``nochange`` (no tile changed -- base/token untouched), ``diff``
-    (changed tiles merged into region PNGs), or ``full`` (the diff would be
-    >= a full frame, so sending it would be a pessimization). Runs off the
-    event loop via ``asyncio.to_thread``.
+    (changed tiles merged into lossy region images), or ``full`` (the diff
+    would be >= a full frame, so sending it would be a pessimization). Runs off
+    the event loop via ``asyncio.to_thread``.
     """
     h, w = pixels.shape[:2]
 
-    # Shape mismatch (resolution change) -> can't tile-diff; send a full frame.
+    # Shape mismatch (resolution / max_width change) -> can't tile-diff; full.
     if base_pixels.shape != pixels.shape:
-        return _full_response(png, pixels)
+        return _full_response(pixels, native_w, native_h, pil_fmt, quality)
 
     grid = _changed_tile_grid(base_pixels, pixels, TILE_SIZE)
     changed = int(grid.sum())
@@ -388,43 +487,65 @@ def _diff_or_full(
     # Coverage full-fallback: a (near-)whole-screen change can't be cheaper as a
     # diff than as one full frame, so don't bother cropping/encoding it.
     if changed >= FULL_COVERAGE * grid.size:
-        return _full_response(png, pixels)
+        return _full_response(pixels, native_w, native_h, pil_fmt, quality)
 
     rects = _merge_tiles_to_rects(grid, TILE_SIZE, w, h)
     regions = []
     region_bytes = 0
     for (x, y, rw, rh) in rects:
-        rpng = _encode_crop_png(pixels, x, y, rw, rh)
-        region_bytes += len(rpng)
+        rimg = _encode_crop(pixels, x, y, rw, rh, pil_fmt, quality)
+        region_bytes += len(rimg)
         regions.append(
-            {"x": x, "y": y, "w": rw, "h": rh, "image": base64.b64encode(rpng).decode()}
+            {"x": x, "y": y, "w": rw, "h": rh, "image": base64.b64encode(rimg).decode()}
         )
 
-    # Byte full-fallback: never ship a diff that's >= the full frame on the wire.
-    if region_bytes >= len(png):
-        return _full_response(png, pixels)
+    # Byte full-fallback: never ship a diff that's >= one full frame on the wire.
+    # Compared on the *lossy* sizes (both region crops and the full are encoded
+    # with the same format/quality), so the rule stays apples-to-apples.
+    full_image = _encode_pixels(pixels, pil_fmt, quality)
+    if region_bytes >= len(full_image):
+        token = _frames.set(full_image, pixels)
+        return {
+            "mode": "full",
+            "frame_token": token,
+            "image": base64.b64encode(full_image).decode(),
+            "width": w,
+            "height": h,
+            "native_width": native_w,
+            "native_height": native_h,
+        }
 
-    new_token = _frames.set(png, pixels)
+    new_token = _frames.set(full_image, pixels)
     return {
         "mode": "diff",
         "frame_token": new_token,
         "base_token": base_token,
         "width": w,
         "height": h,
+        "native_width": native_w,
+        "native_height": native_h,
         "regions": regions,
     }
 
 
 @app.post("/screenshot")
 async def screenshot(body: ScreenshotBody) -> JSONResponse:
-    """Capture a frame and return it as ``full``, ``diff``, or ``nochange``.
+    """Capture a frame, downscale + lossy-encode it, and return it as ``full``,
+    ``diff``, or ``nochange``.
+
+    The captured frame is first downscaled to ``max_width`` (default: native, a
+    no-op) so the held base and every region crop are in the *shown* space the
+    client composites in; then encoded in ``format`` at ``quality``. The
+    response carries both the shown ``width``/``height`` and the real
+    ``native_width``/``native_height`` so the client can scale coordinates.
 
     Decision tree (single base frame per instance, see ``_FrameState``):
-      * ``mode=="full"``, no base yet, or ``since`` != the current base token
-        -> return ``full`` and set the new base.
-      * else compare current vs base per 64px tile:
+      * ``mode=="full"``, no base yet, ``since`` != the current base token, or a
+        ``max_width`` that differs from the held base's width (different base
+        size invalidates the diff) -> return ``full`` and set the new base.
+      * else compare current vs base per 64px tile (in shown space):
           - no tile changed            -> ``nochange`` (token unchanged)
-          - tiles changed              -> ``diff`` of merged region PNGs
+          - tiles changed              -> ``diff`` of merged region images
           - >=90% of tiles changed, or
             diff bytes >= full bytes   -> ``full`` (don't ship an oversized diff)
     The client composites diff regions onto its cached base to reconstruct the
@@ -435,15 +556,42 @@ async def screenshot(body: ScreenshotBody) -> JSONResponse:
     except ToolActionError as exc:
         return _err(str(exc))
 
-    pixels = _decode_rgb(png)
-    base_token, _base_png, base_pixels = _frames.snapshot()
+    pil_fmt, quality, max_width = _normalize_encoding(
+        body.format, body.quality, body.max_width
+    )
 
-    # Forced full / first frame / caller's base doesn't match ours -> full.
-    if body.mode == "full" or base_pixels is None or body.since != base_token:
-        return JSONResponse(_full_response(png, pixels))
+    def _prepare() -> tuple[np.ndarray, int, int]:
+        native = _decode_rgb(png)
+        native_h, native_w = native.shape[:2]
+        shown = _downscale_to_width(native, max_width)
+        return shown, native_w, native_h
+
+    pixels, native_w, native_h = await asyncio.to_thread(_prepare)
+    base_token, _base_image, base_pixels, base_width = _frames.snapshot()
+
+    # Forced full / first frame / caller's base doesn't match ours, or the
+    # requested max_width yields a different shown width than the held base (a
+    # different base size can't be tile-diffed) -> full.
+    if (
+        body.mode == "full"
+        or base_pixels is None
+        or body.since != base_token
+        or base_width != pixels.shape[1]
+    ):
+        payload = await asyncio.to_thread(
+            _full_response, pixels, native_w, native_h, pil_fmt, quality
+        )
+        return JSONResponse(payload)
 
     payload = await asyncio.to_thread(
-        _diff_or_full, png, pixels, base_token, base_pixels
+        _diff_or_full,
+        pixels,
+        base_token,
+        base_pixels,
+        native_w,
+        native_h,
+        pil_fmt,
+        quality,
     )
     return JSONResponse(payload)
 
