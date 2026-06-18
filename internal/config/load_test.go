@@ -60,9 +60,12 @@ func TestFileConfigRoundTrip(t *testing.T) {
 		Listen:                "0.0.0.0:8443",
 		APIKey:                "k_admin",
 		Provider:              "hetzner",
+		Image:                 "ecu-snap",                        // C7: pre-baked snapshot NAME
+		ContainerImage:        "ghcr.io/backhand/ecu-image:v1.2", // C7: container image ref (distinct)
 		MaxSessions:           5,
 		IdleTimeout:           45 * time.Minute,
 		MaxLifetime:           4 * time.Hour,
+		BakeTimeout:           25 * time.Minute, // C7
 		MaxPersistentSessions: 2,
 		DevToolServer:         "http://127.0.0.1:8000",
 	}
@@ -80,6 +83,8 @@ func TestFileConfigRoundTrip(t *testing.T) {
 		reloaded.Listen != original.Listen ||
 		reloaded.APIKey != original.APIKey ||
 		reloaded.Provider != original.Provider ||
+		reloaded.Image != original.Image ||
+		reloaded.ContainerImage != original.ContainerImage ||
 		reloaded.MaxSessions != original.MaxSessions ||
 		reloaded.MaxPersistentSessions != original.MaxPersistentSessions ||
 		reloaded.DevToolServer != original.DevToolServer {
@@ -90,6 +95,9 @@ func TestFileConfigRoundTrip(t *testing.T) {
 	}
 	if reloaded.MaxLifetime != original.MaxLifetime {
 		t.Fatalf("MaxLifetime = %v, want %v", reloaded.MaxLifetime, original.MaxLifetime)
+	}
+	if reloaded.BakeTimeout != original.BakeTimeout {
+		t.Fatalf("BakeTimeout = %v, want %v", reloaded.BakeTimeout, original.BakeTimeout)
 	}
 }
 

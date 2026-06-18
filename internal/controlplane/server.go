@@ -17,6 +17,7 @@ package controlplane
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/backhand/ecu/internal/provider"
@@ -82,6 +83,23 @@ type Server struct {
 	// driven deterministically without real sleeping. ONLY the reaper uses it;
 	// the broker and store stamp real wall-clock time.
 	now func() time.Time
+
+	// bakeCfg carries the C7 pre-bake settings (see BakeConfig). Only consulted
+	// by StartBake, which main invokes on startup when ECU_IMAGE is set.
+	bakeCfg BakeConfig
+
+	// bakeRegistry maps a per-bake token to the channel its outbound completion
+	// callback fires. The (API-key-exempt, token-authed) bake callback handler
+	// reads it; the baker registers/unregisters around each bake.
+	bakeRegistry *bakeRegistry
+
+	// activeBootImage is the image reference NEW sessions boot from once a bake
+	// completes (or a pre-existing snapshot is found at startup). Empty means
+	// "not set yet" and ActiveBootImage falls back to provisionCfg.BaseImage (the
+	// cold-boot OS image). Guarded by bootImageMu so the baker (writer) and the
+	// provisioning flow (reader) never race.
+	activeBootImage string
+	bootImageMu     sync.RWMutex
 }
 
 // ProvisionConfig carries the settings the production provisioning path needs.
@@ -144,6 +162,13 @@ func WithProvisionConfig(cfg ProvisionConfig) ServerOption {
 	return func(s *Server) { s.provisionCfg = cfg }
 }
 
+// WithBakeConfig supplies the C7 pre-bake settings (see BakeConfig). It is set
+// when ECU_IMAGE is configured; main then calls StartBake on startup. Without
+// it (ECU_IMAGE unset) no bake runs and sessions cold-boot, unchanged.
+func WithBakeConfig(cfg BakeConfig) ServerOption {
+	return func(s *Server) { s.bakeCfg = cfg }
+}
+
 // WithReaperConfig supplies the C5 reaper's timeouts and tick interval (see
 // ReaperConfig). Without it the reaper runs with idle/lifetime disabled and a
 // default interval; the orphan rule still protects against leaked instances.
@@ -178,6 +203,7 @@ func NewServer(st *store.Store, devToolServer string, opts ...ServerOption) *Ser
 	s := &Server{
 		store:         st,
 		registry:      newTunnelRegistry(),
+		bakeRegistry:  newBakeRegistry(),
 		devToolServer: devToolServer,
 	}
 	for _, opt := range opts {
@@ -215,14 +241,19 @@ func (s *Server) resolveEndpoint(sessionID string) (string, bool) {
 // Handler returns the fully assembled http.Handler: a net/http.ServeMux using
 // method+wildcard patterns (Go 1.22+).
 //
-// All /sessions* routes stay behind the API-key auth middleware. The C3 tunnel
-// ingress GET /agent/connect is the ONE exception — it authenticates with a
-// per-session tunnel token, not an API key, so the (path-aware) authMiddleware
-// skips it and the handler performs its own token check before upgrading. We
-// keep a single mux (rather than splitting protected/root muxes) so the
+// All /sessions* routes stay behind the API-key auth middleware. TWO routes are
+// exceptions, each authenticated by its own per-operation token rather than an
+// API key (so the path-aware authMiddleware skips them and each handler does its
+// own constant-time token check):
+//   - GET /agent/connect — the C3 tunnel ingress (per-session tunnel token).
+//   - POST /internal/bake/{token}/done — the C7 bake-completion callback fired
+//     OUTBOUND by a bake instance (per-bake token). A bake instance has no API
+//     key, so it must be exempt, exactly like /agent/connect.
+//
+// We keep a single mux (rather than splitting protected/root muxes) so the
 // existing method-based pattern matching for /sessions and /sessions/{id}... is
-// untouched; the exemption is a single path check in authMiddleware, which is
-// clearly correct and keeps every existing auth test green.
+// untouched; the exemptions are path checks in authMiddleware, which are clearly
+// correct and keep every existing auth test green.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /sessions", s.handleCreateSession)
@@ -230,6 +261,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{id}/{action}", s.handleAction)
 	mux.HandleFunc("GET /agent/connect", s.handleAgentConnect)
+	mux.HandleFunc("POST /internal/bake/{token}/done", s.handleBakeDone)
 	return s.authMiddleware(mux)
 }
 

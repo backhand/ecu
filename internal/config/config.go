@@ -35,6 +35,15 @@ const (
 	// defaultBaseImage is the cold-boot base OS image used when no pre-baked
 	// image is configured.
 	defaultBaseImage = "ubuntu-24.04"
+	// defaultContainerImage is the container (Docker) image cloud-init pulls and
+	// runs on the instance, distinct from the pre-baked snapshot NAME (Image /
+	// ECU_IMAGE). It is what a bake pulls and what a session runs.
+	defaultContainerImage = "ghcr.io/backhand/ecu-image:latest"
+	// defaultBakeTimeout bounds how long the C7 pre-bake waits for the bake
+	// instance to finish pulling the (multi-GB) container image and call back
+	// before tearing the bake instance down. Generous on purpose — a cold pull
+	// over a slow link is minutes.
+	defaultBakeTimeout = 20 * time.Minute
 	// C5 reaper / cap defaults. They apply when neither env nor file supplies a
 	// value. defaultMaxSessions is the global active-session cap; explicitly
 	// setting ECU_MAX_SESSIONS=0 disables it (unlimited). defaultIdleTimeout and
@@ -81,14 +90,30 @@ type Config struct {
 	// Region is the provider region (ECU_REGION). Consumed by C4.
 	Region string
 
-	// Image is the pre-baked provider image name (ECU_IMAGE). Consumed by the
-	// pre-baking component (C7).
+	// Image is the pre-baked provider SNAPSHOT NAME (ECU_IMAGE). It controls C7
+	// pre-baking: when set, the control plane looks up (or auto-builds) a
+	// provider snapshot under this name and boots sessions from it. It is NOT a
+	// container/Docker image ref — see ContainerImage for that. Empty disables
+	// pre-baking (sessions cold-boot from BaseImage).
 	Image string
+
+	// ContainerImage is the container (Docker) image ref that cloud-init pulls
+	// and `docker run`s on the instance (ECU_CONTAINER_IMAGE), e.g.
+	// "ghcr.io/backhand/ecu-image:latest". This is a DISTINCT concept from Image
+	// (ECU_IMAGE, the pre-baked snapshot name): a bake instance pulls THIS image
+	// to produce the snapshot, and every session runs THIS image. Defaults to
+	// defaultContainerImage.
+	ContainerImage string
 
 	// BaseImage is the cold-boot base OS image (ECU_BASE_IMAGE), used by C4
 	// provisioning when no pre-baked image is available. Distinct from Image
-	// (the pre-baked image name). Defaults to defaultBaseImage.
+	// (the pre-baked snapshot name). Defaults to defaultBaseImage.
 	BaseImage string
+
+	// BakeTimeout bounds how long C7 pre-baking waits for the bake instance to
+	// pull the container image and call back before tearing it down
+	// (ECU_BAKE_TIMEOUT). Defaults to defaultBakeTimeout.
+	BakeTimeout time.Duration
 
 	// AgentBinaryURL is where the instance fetches the `ecu` binary from
 	// (ECU_AGENT_BINARY_URL), injected into cloud-init (C4). C10 supplies real
@@ -158,9 +183,11 @@ type fileConfig struct {
 	InstanceType          string `json:"instance_type,omitempty"`
 	Region                string `json:"region,omitempty"`
 	Image                 string `json:"image,omitempty"`
+	ContainerImage        string `json:"container_image,omitempty"`
 	BaseImage             string `json:"base_image,omitempty"`
 	AgentBinaryURL        string `json:"agent_binary_url,omitempty"`
 	ProvisionTimeout      string `json:"provision_timeout,omitempty"`
+	BakeTimeout           string `json:"bake_timeout,omitempty"`
 	MaxSessions           int    `json:"max_sessions,omitempty"`
 	IdleTimeout           string `json:"idle_timeout,omitempty"`
 	MaxLifetime           string `json:"max_lifetime,omitempty"`
@@ -273,6 +300,7 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	c.InstanceType = pick(env["ECU_INSTANCE_TYPE"], fileCfg.InstanceType)
 	c.Region = pick(env["ECU_REGION"], fileCfg.Region)
 	c.Image = pick(env["ECU_IMAGE"], fileCfg.Image)
+	c.ContainerImage = pick(env["ECU_CONTAINER_IMAGE"], fileCfg.ContainerImage, defaultContainerImage)
 	c.BaseImage = pick(env["ECU_BASE_IMAGE"], fileCfg.BaseImage, defaultBaseImage)
 	c.AgentBinaryURL = pick(env["ECU_AGENT_BINARY_URL"], fileCfg.AgentBinaryURL)
 	c.DevToolServer = pick(env["ECU_DEV_TOOLSERVER"], fileCfg.DevToolServer)
@@ -321,6 +349,13 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	if c.ProvisionTimeout, err = parseDurationSetting("ECU_PROVISION_TIMEOUT", env["ECU_PROVISION_TIMEOUT"], fileProvTimeout); err != nil {
 		return nil, false, err
 	}
+	var fileBakeTimeout string
+	if fileCfg.BakeTimeout != 0 {
+		fileBakeTimeout = fileCfg.BakeTimeout.String()
+	}
+	if c.BakeTimeout, err = parseDurationSetting("ECU_BAKE_TIMEOUT", env["ECU_BAKE_TIMEOUT"], fileBakeTimeout); err != nil {
+		return nil, false, err
+	}
 
 	// Apply duration defaults where unset (zero). A zero IdleTimeout/MaxLifetime
 	// would DISABLE those reaper rules; operators expect the documented defaults
@@ -338,6 +373,9 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	}
 	if c.ProvisionTimeout == 0 {
 		c.ProvisionTimeout = defaultProvisionTimeout
+	}
+	if c.BakeTimeout == 0 {
+		c.BakeTimeout = defaultBakeTimeout
 	}
 
 	// Path settings: env > file > default, then expand ~.

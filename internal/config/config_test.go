@@ -188,3 +188,63 @@ func TestResolveParsesTypedSettings(t *testing.T) {
 		t.Fatalf("resolve accepted an invalid ECU_IDLE_TIMEOUT, want error")
 	}
 }
+
+// TestResolvePreBakeSettings exercises the C7 settings and, crucially, that
+// ECU_IMAGE (the pre-baked SNAPSHOT NAME) and ECU_CONTAINER_IMAGE (the container
+// image ref) are DISTINCT: ECU_IMAGE has no default (empty disables pre-baking),
+// while ECU_CONTAINER_IMAGE defaults to defaultContainerImage. ECU_BAKE_TIMEOUT
+// parses as a duration and defaults to defaultBakeTimeout.
+func TestResolvePreBakeSettings(t *testing.T) {
+	base := map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000"}
+
+	// Defaults: ECU_IMAGE empty (no pre-baking), container image + bake timeout
+	// take their defaults.
+	cfg, _, err := resolve(base, nil, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.Image != "" {
+		t.Fatalf("cfg.Image = %q, want empty by default (ECU_IMAGE controls pre-baking)", cfg.Image)
+	}
+	if cfg.ContainerImage != defaultContainerImage {
+		t.Fatalf("cfg.ContainerImage = %q, want default %q", cfg.ContainerImage, defaultContainerImage)
+	}
+	if cfg.BakeTimeout != defaultBakeTimeout {
+		t.Fatalf("cfg.BakeTimeout = %v, want default %v", cfg.BakeTimeout, defaultBakeTimeout)
+	}
+
+	// Env values: the snapshot name and container ref are independent values, and
+	// the bake timeout parses.
+	env := map[string]string{
+		"ECU_API_KEY":         "k",
+		"ECU_DEV_TOOLSERVER":  "http://127.0.0.1:8000",
+		"ECU_IMAGE":           "ecu-prebaked",
+		"ECU_CONTAINER_IMAGE": "ghcr.io/backhand/ecu-image:pinned",
+		"ECU_BAKE_TIMEOUT":    "30m",
+	}
+	cfg, _, err = resolve(env, nil, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.Image != "ecu-prebaked" {
+		t.Fatalf("cfg.Image (snapshot name) = %q, want ecu-prebaked", cfg.Image)
+	}
+	if cfg.ContainerImage != "ghcr.io/backhand/ecu-image:pinned" {
+		t.Fatalf("cfg.ContainerImage = %q, want the pinned ref", cfg.ContainerImage)
+	}
+	if cfg.BakeTimeout != 30*time.Minute {
+		t.Fatalf("cfg.BakeTimeout = %v, want 30m", cfg.BakeTimeout)
+	}
+
+	// Precedence: ECU_CONTAINER_IMAGE env beats file beats default.
+	cfg, _, err = resolve(
+		map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000"},
+		&Config{ContainerImage: "ghcr.io/from-file:tag"}, false, requiredKeys,
+	)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.ContainerImage != "ghcr.io/from-file:tag" {
+		t.Fatalf("cfg.ContainerImage = %q, want file value (file beats default)", cfg.ContainerImage)
+	}
+}

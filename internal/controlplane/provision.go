@@ -59,12 +59,16 @@ func (s *Server) provisionSession(sessionID, tunnelToken string) {
 		return
 	}
 
-	// 2. Create the instance.
+	// 2. Create the instance. BaseImage is read from ActiveBootImage so a session
+	// provisioned BEFORE a pre-bake completes cold-boots from the OS image and one
+	// AFTER boots from the snapshot — the single provisioning hook for C7. On a
+	// baked instance the session cloud-init's `docker run` finds the image locally
+	// and skips the pull.
 	spec := provider.InstanceSpec{
 		Name:      instanceName(sessionID),
 		Type:      s.provisionCfg.InstanceType,
 		Region:    s.provisionCfg.Region,
-		BaseImage: s.provisionCfg.BaseImage,
+		BaseImage: s.ActiveBootImage(),
 		UserData:  userData,
 		Labels:    map[string]string{"ecu-session": sessionID},
 	}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -134,6 +135,164 @@ func TestCreateInstance(t *testing.T) {
 	}
 	if labels["ecu-session"] != "s_abc" {
 		t.Fatalf("labels missing spec label ecu-session: %v", labels)
+	}
+}
+
+// TestCreateInstanceBootsFromSnapshotID verifies the C7 footgun fix: an
+// all-digit BaseImage is sent as an image ID (a snapshot is nameless and booted
+// by numeric id), whereas a non-numeric BaseImage is sent as a name. The hcloud
+// schema marshals an id-only IDOrName as a JSON NUMBER and a name-only one as a
+// STRING, which is exactly how we distinguish the two in the request body.
+func TestCreateInstanceBootsFromSnapshotID(t *testing.T) {
+	cases := []struct {
+		name      string
+		baseImage string
+		// wantNumeric is true when the image field must marshal as a JSON number
+		// (an ID); false when it must be the string name.
+		wantNumeric bool
+		wantValue   string // the expected stringified value either way
+	}{
+		{"numeric base image is an ID", "12345", true, "12345"},
+		{"named base image is a name", "ubuntu-24.04", false, "ubuntu-24.04"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var createBody map[string]any
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /servers", func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &createBody)
+				writeJSON(w, http.StatusCreated, `{
+  "server": { "id": 4711, "name": "ecu-test", "status": "running",
+    "public_net": { "ipv4": { "id": 1, "ip": "203.0.113.42", "blocked": false, "dns_ptr": "" },
+                    "ipv6": { "id": 2, "ip": "", "blocked": false, "dns_ptr": [] },
+                    "floating_ips": [], "firewalls": [] },
+    "private_net": [], "server_type": { "id": 22, "name": "cpx21" },
+    "datacenter": null, "image": null, "iso": null,
+    "protection": { "delete": false, "rebuild": false }, "labels": {}, "volumes": [] },
+  "action": { "id": 1, "command": "create_server", "status": "success",
+              "progress": 100, "started": "2024-01-01T00:00:00Z", "finished": "2024-01-01T00:00:05Z",
+              "resources": [ { "id": 4711, "type": "server" } ], "error": null },
+  "next_actions": [], "root_password": null
+}`)
+			})
+			mux.HandleFunc("GET /servers/4711", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{ "server": { "id": 4711, "name": "ecu-test", "status": "running",
+    "public_net": { "ipv4": { "id": 1, "ip": "203.0.113.42", "blocked": false, "dns_ptr": "" },
+                    "ipv6": { "id": 2, "ip": "", "blocked": false, "dns_ptr": [] },
+                    "floating_ips": [], "firewalls": [] },
+    "private_net": [], "server_type": { "id": 22, "name": "cpx21" },
+    "datacenter": null, "image": null, "iso": null,
+    "protection": { "delete": false, "rebuild": false }, "labels": {}, "volumes": [] } }`)
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			p := newTestProvider(t, ts, provider.Config{DefaultType: "cpx21"})
+			if _, err := p.CreateInstance(t.Context(), provider.InstanceSpec{
+				Name: "ecu-test", Type: "cpx21", BaseImage: tc.baseImage,
+				UserData: "#cloud-config\n# x",
+			}); err != nil {
+				t.Fatalf("CreateInstance: %v", err)
+			}
+
+			img := createBody["image"]
+			switch v := img.(type) {
+			case float64: // JSON numbers decode to float64 — this is the ID path
+				if !tc.wantNumeric {
+					t.Fatalf("image marshaled as a number (%v) but a NAME was expected", v)
+				}
+				if got := strconv.FormatInt(int64(v), 10); got != tc.wantValue {
+					t.Fatalf("image id = %s, want %s", got, tc.wantValue)
+				}
+			case string:
+				if tc.wantNumeric {
+					t.Fatalf("image marshaled as a string (%q) but an ID (number) was expected", v)
+				}
+				if v != tc.wantValue {
+					t.Fatalf("image name = %q, want %q", v, tc.wantValue)
+				}
+			default:
+				t.Fatalf("image field has unexpected type %T (%v)", img, img)
+			}
+		})
+	}
+}
+
+// TestImageRefHelper unit-tests the id-vs-name detection directly.
+func TestImageRefHelper(t *testing.T) {
+	if ref := imageRef("98765"); ref.ID != 98765 || ref.Name != "" {
+		t.Fatalf("imageRef(numeric) = %+v, want ID=98765 Name=\"\"", ref)
+	}
+	if ref := imageRef("ubuntu-24.04"); ref.Name != "ubuntu-24.04" || ref.ID != 0 {
+		t.Fatalf("imageRef(name) = %+v, want Name=ubuntu-24.04 ID=0", ref)
+	}
+}
+
+// --- DeleteInstancesByLabel --------------------------------------------------
+
+// TestDeleteInstancesByLabel verifies the orphan-cleanup primitive lists by the
+// label selector and deletes each matching server, returning the count.
+func TestDeleteInstancesByLabel(t *testing.T) {
+	var gotSelector string
+	deleted := map[string]bool{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /servers", func(w http.ResponseWriter, r *http.Request) {
+		gotSelector = r.URL.Query().Get("label_selector")
+		writeJSON(w, http.StatusOK, `{
+  "servers": [
+    { "id": 101, "name": "ecu-bake", "status": "running",
+      "public_net": { "ipv4": { "id": 1, "ip": "203.0.113.7", "blocked": false, "dns_ptr": "" },
+                      "ipv6": { "id": 2, "ip": "", "blocked": false, "dns_ptr": [] }, "floating_ips": [], "firewalls": [] },
+      "private_net": [], "server_type": { "id": 22, "name": "cpx21" }, "datacenter": null,
+      "image": null, "iso": null, "protection": { "delete": false, "rebuild": false },
+      "labels": { "ecu-bake": "1" }, "volumes": [] }
+  ],
+  "meta": { "pagination": { "page": 1, "per_page": 50, "previous_page": null,
+            "next_page": null, "last_page": 1, "total_entries": 1 } }
+}`)
+	})
+	mux.HandleFunc("DELETE /servers/101", func(w http.ResponseWriter, r *http.Request) {
+		deleted["101"] = true
+		writeJSON(w, http.StatusOK, `{ "action": { "id": 11, "command": "delete_server", "status": "success",
+              "progress": 100, "started": "2024-01-01T00:00:00Z", "finished": "2024-01-01T00:00:01Z",
+              "resources": [ { "id": 101, "type": "server" } ], "error": null } }`)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	p := newTestProvider(t, ts, provider.Config{})
+	n, err := p.DeleteInstancesByLabel(t.Context(), "ecu-bake", "1")
+	if err != nil {
+		t.Fatalf("DeleteInstancesByLabel: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted count = %d, want 1", n)
+	}
+	if gotSelector != "ecu-bake=1" {
+		t.Fatalf("label_selector = %q, want ecu-bake=1", gotSelector)
+	}
+	if !deleted["101"] {
+		t.Fatalf("server 101 was not deleted")
+	}
+}
+
+// TestDeleteInstancesByLabelNoneMatch verifies that matching nothing returns
+// (0, nil) — the idempotent no-op orphan-cleanup runs on every startup.
+func TestDeleteInstancesByLabelNoneMatch(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /servers", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{ "servers": [],
+  "meta": { "pagination": { "page": 1, "per_page": 50, "previous_page": null,
+            "next_page": null, "last_page": 1, "total_entries": 0 } } }`)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	p := newTestProvider(t, ts, provider.Config{})
+	n, err := p.DeleteInstancesByLabel(t.Context(), "ecu-bake", "1")
+	if err != nil || n != 0 {
+		t.Fatalf("DeleteInstancesByLabel(none) = (%d, %v), want (0, nil)", n, err)
 	}
 }
 

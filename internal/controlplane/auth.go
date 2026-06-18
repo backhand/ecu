@@ -6,6 +6,15 @@ import (
 	"strings"
 )
 
+// bakeCallbackExempt reports whether path is the C7 bake-completion callback
+// (POST /internal/bake/{token}/done). Like agentConnectPath it is EXEMPT from
+// API-key auth: a bake instance has no API key and authenticates with its
+// per-bake token, checked (constant-time) in handleBakeDone. The check is a
+// prefix+suffix match on the dynamic {token} segment so it covers every token.
+func bakeCallbackExempt(path string) bool {
+	return strings.HasPrefix(path, bakeCallbackPrefix) && strings.HasSuffix(path, "/done")
+}
+
 // ctxKey is an unexported type for context keys defined in this package, so
 // values stored under it cannot collide with keys from other packages.
 type ctxKey int
@@ -32,16 +41,19 @@ const agentConnectPath = "/agent/connect"
 // store and, on success, attaches the resolved account to the request context.
 // Every failure mode — missing header, malformed header, empty key, unknown
 // key, and disabled key — is rejected with 401 and a JSON {"detail": ...} body.
-// It wraps the entire mux so all routes are authenticated EXCEPT the tunnel
-// ingress agentConnectPath, which uses tunnel-token auth handled in its own
-// handler (see broker.go). A single path check is preferred over splitting the
-// mux because it leaves the existing method-based /sessions routing — and every
-// auth test that exercises it — completely unchanged.
+// It wraps the entire mux so all routes are authenticated EXCEPT two
+// token-authed endpoints: the tunnel ingress agentConnectPath (tunnel-token auth,
+// see broker.go) and the C7 bake-completion callback (per-bake-token auth, see
+// bake.go). Both do their own constant-time token check in their handlers. Path
+// checks are preferred over splitting the mux because they leave the existing
+// method-based /sessions routing — and every auth test that exercises it —
+// completely unchanged.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == agentConnectPath {
-			// Tunnel ingress: API-key auth does not apply; the handler does its
-			// own per-session token check before upgrading.
+		if r.URL.Path == agentConnectPath || bakeCallbackExempt(r.URL.Path) {
+			// Token-authed endpoints (tunnel ingress / bake-completion callback):
+			// API-key auth does not apply; each handler does its own constant-time
+			// per-operation token check.
 			next.ServeHTTP(w, r)
 			return
 		}

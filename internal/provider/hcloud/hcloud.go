@@ -75,7 +75,7 @@ func (p *Provider) CreateInstance(ctx context.Context, spec provider.InstanceSpe
 	opts := hcloudapi.ServerCreateOpts{
 		Name:       spec.Name,
 		ServerType: &hcloudapi.ServerType{Name: serverType},
-		Image:      &hcloudapi.Image{Name: spec.BaseImage},
+		Image:      imageRef(spec.BaseImage),
 		UserData:   spec.UserData,
 		Labels:     p.mergeLabels(spec.Labels),
 	}
@@ -152,6 +152,36 @@ func (p *Provider) DeleteInstance(ctx context.Context, id string) error {
 		return fmt.Errorf("hcloud: deleting server %s: %w", id, err)
 	}
 	return nil
+}
+
+// DeleteInstancesByLabel lists managed servers matching key=value and deletes
+// each, returning how many were destroyed. Used by C7 startup orphan cleanup to
+// reap a leaked bake instance. It is best-effort and idempotent: it tolerates a
+// server vanishing between the list and the delete (not_found -> skip) and
+// returns the count actually destroyed. A list error is reported; per-server
+// delete errors are aggregated so one bad server does not hide the rest.
+func (p *Provider) DeleteInstancesByLabel(ctx context.Context, key, value string) (int, error) {
+	servers, err := p.client.Server.AllWithOpts(ctx, hcloudapi.ServerListOpts{
+		ListOpts: hcloudapi.ListOpts{LabelSelector: key + "=" + value},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("hcloud: listing servers by label %s=%s: %w", key, value, err)
+	}
+	deleted := 0
+	var firstErr error
+	for _, srv := range servers {
+		if _, err := p.client.Server.Delete(ctx, srv); err != nil {
+			if hcloudapi.IsError(err, hcloudapi.ErrorCodeNotFound) {
+				continue // already gone between list and delete
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("hcloud: deleting server %d: %w", srv.ID, err)
+			}
+			continue
+		}
+		deleted++
+	}
+	return deleted, firstErr
 }
 
 // CreateImage snapshots fromInstance into a named image (C7 pre-baking). The
@@ -263,6 +293,20 @@ func (p *Provider) mergeLabels(specLabels map[string]string) map[string]string {
 	}
 	out[managedLabelKey] = managedLabelValue
 	return out
+}
+
+// imageRef builds the hcloud Image reference to boot from for a given
+// InstanceSpec.BaseImage. Hetzner distinguishes a NAMED OS image (e.g.
+// "ubuntu-24.04") from a SNAPSHOT, which is referenced by its numeric id — a
+// snapshot has no name. C7 (pre-baking) supplies a snapshot's id as BaseImage,
+// so an all-digit value is treated as an image ID and anything else as a name.
+// This is the footgun the brief calls out: booting a snapshot via {Name: ...}
+// silently fails because snapshots are nameless.
+func imageRef(baseImage string) *hcloudapi.Image {
+	if n, err := strconv.ParseInt(baseImage, 10, 64); err == nil {
+		return &hcloudapi.Image{ID: n}
+	}
+	return &hcloudapi.Image{Name: baseImage}
 }
 
 // publicIPv4 returns the server's public IPv4 as a string, or "" if unset.

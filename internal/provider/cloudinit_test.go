@@ -156,6 +156,109 @@ func TestRenderCloudInitSample(t *testing.T) {
 	t.Logf("rendered #cloud-config:\n%s", out)
 }
 
+// --- Bake cloud-init (C7) -----------------------------------------------------
+
+// TestRenderBakeCloudInitContents asserts the bake cloud-init pulls the image,
+// fires the OUTBOUND callback, and — critically — does NOT run the container,
+// install the agent, or carry any session token. The snapshot must be a clean
+// "image-pulled, nothing running" disk.
+func TestRenderBakeCloudInitContents(t *testing.T) {
+	const (
+		imageRef    = "ghcr.io/backhand/ecu-image:latest"
+		callbackURL = "https://ecu.example.com/internal/bake/b_deadbeef/done"
+	)
+	out, err := RenderBakeCloudInit(BakeCloudInitParams{ImageRef: imageRef, CallbackURL: callbackURL})
+	if err != nil {
+		t.Fatalf("RenderBakeCloudInit: %v", err)
+	}
+
+	// First line is exactly #cloud-config.
+	firstLine := out
+	if i := strings.IndexByte(out, '\n'); i >= 0 {
+		firstLine = out[:i]
+	}
+	if firstLine != "#cloud-config" {
+		t.Fatalf("first line = %q, want %q", firstLine, "#cloud-config")
+	}
+
+	// Must pull the image, install Docker, and fire the outbound callback. The
+	// callback MUST be a POST to match the control-plane route (a plain GET would
+	// hit a 405 and the bake would always time out — a real footgun).
+	for _, want := range []string{
+		"get.docker.com",
+		"docker pull " + imageRef,
+		callbackURL,
+		"curl -fsS -X POST " + callbackURL, // outbound POST callback (method matters)
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("bake cloud-init missing %q\n---\n%s", want, out)
+		}
+	}
+
+	// Must NOT run the container, install/run the agent, or carry any session
+	// token — those belong only to the session cloud-init.
+	for _, forbidden := range []string{
+		"docker run",
+		"--agent",
+		"ecu-agent.service",
+		"--token",
+		"/usr/local/bin/ecu",
+		"--tool-server",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("bake cloud-init must NOT contain %q (it only pulls + calls back)\n---\n%s", forbidden, out)
+		}
+	}
+}
+
+// TestRenderBakeCloudInitDefaultsAndGuards verifies the image-ref default and
+// the required-callback guard.
+func TestRenderBakeCloudInitDefaultsAndGuards(t *testing.T) {
+	// Default image ref applies when ImageRef is empty.
+	out, err := RenderBakeCloudInit(BakeCloudInitParams{CallbackURL: "https://x/internal/bake/b_1/done"})
+	if err != nil {
+		t.Fatalf("RenderBakeCloudInit: %v", err)
+	}
+	if !strings.Contains(out, defaultImageRef) {
+		t.Fatalf("defaulted bake cloud-init missing %q\n---\n%s", defaultImageRef, out)
+	}
+	// A missing callback URL is an error.
+	if _, err := RenderBakeCloudInit(BakeCloudInitParams{ImageRef: "img"}); err == nil {
+		t.Fatalf("expected error for a missing CallbackURL, got nil")
+	}
+}
+
+// TestRenderBakeCloudInitValidYAML checks the bake config parses as YAML.
+func TestRenderBakeCloudInitValidYAML(t *testing.T) {
+	out, err := RenderBakeCloudInit(BakeCloudInitParams{
+		ImageRef:    "ghcr.io/backhand/ecu-image:latest",
+		CallbackURL: "https://ecu.example.com/internal/bake/b_abc/done",
+	})
+	if err != nil {
+		t.Fatalf("RenderBakeCloudInit: %v", err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("rendered bake cloud-init is not valid YAML: %v\n---\n%s", err, out)
+	}
+	if _, ok := doc["runcmd"]; !ok {
+		t.Fatalf("bake cloud-init missing top-level runcmd; keys: %v", keysOf(doc))
+	}
+}
+
+// TestRenderBakeCloudInitSample prints a full rendered sample so
+// `go test -run CloudInit -v` shows exactly what a bake instance receives.
+func TestRenderBakeCloudInitSample(t *testing.T) {
+	out, err := RenderBakeCloudInit(BakeCloudInitParams{
+		ImageRef:    "ghcr.io/backhand/ecu-image:latest",
+		CallbackURL: "https://ecu.example.com/internal/bake/b_deadbeef/done",
+	})
+	if err != nil {
+		t.Fatalf("RenderBakeCloudInit: %v", err)
+	}
+	t.Logf("rendered bake #cloud-config:\n%s", out)
+}
+
 // keysOf returns the keys of a map for error messages.
 func keysOf(m map[string]any) []string {
 	out := make([]string, 0, len(m))

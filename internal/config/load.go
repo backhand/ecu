@@ -142,6 +142,7 @@ func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 		InstanceType:          fc.InstanceType,
 		Region:                fc.Region,
 		Image:                 fc.Image,
+		ContainerImage:        fc.ContainerImage,
 		BaseImage:             fc.BaseImage,
 		AgentBinaryURL:        fc.AgentBinaryURL,
 		MaxSessions:           fc.MaxSessions,
@@ -155,6 +156,13 @@ func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 			return nil, fmt.Errorf("config file provision_timeout: invalid duration %q: %w", fc.ProvisionTimeout, err)
 		}
 		c.ProvisionTimeout = d
+	}
+	if fc.BakeTimeout != "" {
+		d, err := time.ParseDuration(fc.BakeTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("config file bake_timeout: invalid duration %q: %w", fc.BakeTimeout, err)
+		}
+		c.BakeTimeout = d
 	}
 	if fc.IdleTimeout != "" {
 		d, err := time.ParseDuration(fc.IdleTimeout)
@@ -213,6 +221,7 @@ func configToFileConfig(cfg *Config) *fileConfig {
 		InstanceType:          cfg.InstanceType,
 		Region:                cfg.Region,
 		Image:                 cfg.Image,
+		ContainerImage:        cfg.ContainerImage,
 		BaseImage:             cfg.BaseImage,
 		AgentBinaryURL:        cfg.AgentBinaryURL,
 		MaxSessions:           cfg.MaxSessions,
@@ -231,6 +240,9 @@ func configToFileConfig(cfg *Config) *fileConfig {
 	}
 	if cfg.ProvisionTimeout != 0 {
 		fc.ProvisionTimeout = cfg.ProvisionTimeout.String()
+	}
+	if cfg.BakeTimeout != 0 {
+		fc.BakeTimeout = cfg.BakeTimeout.String()
 	}
 	return fc
 }

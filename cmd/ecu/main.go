@@ -62,12 +62,6 @@ func main() {
 	}
 }
 
-// defaultContainerImageRef is the cold-boot container image cloud-init runs
-// when ECU_IMAGE is unset. ECU_IMAGE is the pre-baked-image NAME field today
-// (C7); for a cold boot the instance pulls this container image ref. C7 will
-// govern pre-baking; for now this is a placeholder default.
-const defaultContainerImageRef = "ghcr.io/backhand/ecu-image:latest"
-
 // tunnelURL derives the publicly reachable tunnel ingress the instance agent
 // dials OUT to. With ECU_HOSTNAME set it is wss://<hostname>/agent/connect
 // (TLS, the production form — C10 wires the cert). Otherwise it falls back to
@@ -82,14 +76,17 @@ func tunnelURL(cfg *config.Config) string {
 	return "ws://" + cfg.Listen + "/agent/connect"
 }
 
-// imageRef returns the container image cloud-init runs: cfg.Image if set, else
-// the placeholder default. (cfg.Image is the pre-baked-name field today; this
-// wires it through for the container image ref. C7 handles real pre-baking.)
-func imageRef(cfg *config.Config) string {
-	if cfg.Image != "" {
-		return cfg.Image
+// callbackBaseURL derives the publicly reachable control-plane BASE URL the C7
+// bake instance curls (the per-bake token + "/internal/bake/<token>/done" is
+// appended by the baker). It mirrors tunnelURL's hostname-vs-listen logic but
+// over HTTP(S): https://<hostname> in production (C10 wires the cert), else
+// http://<listen> for local/dev. Same public-reachability dependency as the
+// tunnel URL — a real cloud instance must be able to reach it.
+func callbackBaseURL(cfg *config.Config) string {
+	if cfg.Hostname != "" {
+		return "https://" + cfg.Hostname
 	}
-	return defaultContainerImageRef
+	return "http://" + cfg.Listen
 }
 
 // agentToolServerDefault returns the tool-server URL default for the agent:
@@ -176,8 +173,10 @@ func runControlPlane() error {
 		opts = append(opts,
 			controlplane.WithProvider(prov),
 			controlplane.WithProvisionConfig(controlplane.ProvisionConfig{
-				TunnelURL:        tunnelURL(cfg),
-				ImageRef:         imageRef(cfg),
+				TunnelURL: tunnelURL(cfg),
+				// The container (Docker) image sessions run — ECU_CONTAINER_IMAGE,
+				// distinct from ECU_IMAGE (the pre-baked snapshot name).
+				ImageRef:         cfg.ContainerImage,
 				AgentBinaryURL:   cfg.AgentBinaryURL,
 				InstanceType:     cfg.InstanceType,
 				Region:           cfg.Region,
@@ -188,6 +187,22 @@ func runControlPlane() error {
 				// become configurable.
 			}),
 		)
+		// C7 pre-baking: only when ECU_IMAGE (the snapshot NAME) is set. The
+		// bake pulls ECU_CONTAINER_IMAGE onto a temp instance and snapshots it
+		// under ECU_IMAGE; StartBake (below) either finds an existing snapshot
+		// (fast path) or bakes one in the background. Unset ECU_IMAGE -> no bake,
+		// sessions cold-boot (unchanged).
+		if cfg.Image != "" {
+			opts = append(opts, controlplane.WithBakeConfig(controlplane.BakeConfig{
+				ImageName:       cfg.Image,
+				ContainerImage:  cfg.ContainerImage,
+				CallbackBaseURL: callbackBaseURL(cfg),
+				InstanceType:    cfg.InstanceType,
+				Region:          cfg.Region,
+				BaseImage:       cfg.BaseImage,
+				Timeout:         cfg.BakeTimeout,
+			}))
+		}
 	}
 
 	srv := controlplane.NewServer(st, cfg.DevToolServer, opts...)
@@ -199,6 +214,11 @@ func runControlPlane() error {
 		log.Printf("ecu: DEV tool-server seam enabled (ECU_DEV_TOOLSERVER set); sessions are marked ready immediately")
 	} else {
 		log.Printf("ecu: sessions start in provisioning; they become ready when an instance agent connects to /agent/connect")
+		if cfg.Image != "" {
+			log.Printf("ecu: pre-baking enabled (ECU_IMAGE=%q); will use/auto-build a snapshot of container image %q", cfg.Image, cfg.ContainerImage)
+		} else {
+			log.Printf("ecu: pre-baking disabled (ECU_IMAGE unset); sessions cold-boot from base image %q and pull container image %q", cfg.BaseImage, cfg.ContainerImage)
+		}
 	}
 	if exposeTunnelToken {
 		log.Printf("ecu: DEV tunnel-token exposure enabled (ECU_DEV_EXPOSE_TUNNEL_TOKEN=1); POST /sessions returns the tunnel secret — do NOT use in production")
@@ -217,6 +237,14 @@ func runControlPlane() error {
 	// instances. It runs in dev mode too (teardown is a no-op without a
 	// provider, but idle/lifetime reaping still applies).
 	go srv.RunReaper(ctx)
+
+	// C7 pre-baking: when ECU_IMAGE is set, find an existing snapshot or kick off
+	// a background bake. It is a no-op when ECU_IMAGE is unset or no provider is
+	// configured (dev mode). The bake runs in the background so the control plane
+	// is usable immediately; sessions during a bake cold-boot. ctx is the server
+	// lifecycle context so shutdown aborts an in-flight bake (its temp instance is
+	// still torn down by the baker's deferred teardown).
+	srv.StartBake(ctx)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()

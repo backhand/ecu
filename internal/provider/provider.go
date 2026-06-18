@@ -57,6 +57,14 @@ type Provider interface {
 	// bill).
 	DeleteInstance(ctx context.Context, id string) error
 
+	// DeleteInstancesByLabel destroys every managed instance carrying the given
+	// label key=value, returning the number destroyed. It is the orphan-cleanup
+	// primitive used by C7 pre-baking on startup to reap a temporary bake
+	// instance leaked by a crashed previous run (labeled e.g. ecu-bake=1), so a
+	// restart mid-bake never leaks a paid instance. Like DeleteInstance it is
+	// best-effort and idempotent: matching nothing returns (0, nil).
+	DeleteInstancesByLabel(ctx context.Context, key, value string) (int, error)
+
 	// CreateImage snapshots fromInstance into a named image (pre-baking, C7).
 	CreateImage(ctx context.Context, fromInstance, name string) (Image, error)
 
