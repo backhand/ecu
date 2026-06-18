@@ -84,6 +84,18 @@ type Provider interface {
 	// absent and applying it to all managed instances. Passing nil rules
 	// synthesizes the safe default: block all inbound, allow all outbound.
 	EnsureFirewall(ctx context.Context, rules []FirewallRule) error
+
+	// RequiresCloudInit reports whether the provisioning flow must render
+	// cloud-init for this provider before creating an instance. Cloud providers
+	// (hetzner) return true: the instance boots and runs the cloud-init script
+	// to fetch the `ecu` binary + container image and dial the reverse tunnel.
+	// The local provider returns false: it runs the container directly on the
+	// control-plane box and the control plane reaches it at Instance.Endpoint,
+	// so there is no cloud-init, no agent, and no tunnel in the loop. The
+	// provisioning flow branches on this (skip RenderCloudInit, pass empty
+	// UserData) and on a non-empty Instance.Endpoint (skip the readiness wait —
+	// the provider already waited for health).
+	RequiresCloudInit() bool
 }
 
 // InstanceSpec describes an instance to create, in cloud-neutral terms.
@@ -123,6 +135,12 @@ type InstanceSpec struct {
 type Instance struct {
 	ID       string
 	PublicIP string
+	// Endpoint is the directly-reachable tool-server base URL for instances
+	// that do NOT use the reverse tunnel (e.g. the local Docker provider's
+	// co-located containers, reached at http://127.0.0.1:<port>). Cloud
+	// instances leave it "" — they are reached through the agent's reverse
+	// tunnel, not a direct address.
+	Endpoint string
 	Status   string
 }
 
@@ -147,11 +165,21 @@ type FirewallRule struct {
 // Config is the factory input. The hcloud implementation reads Token, and uses
 // DefaultType / DefaultRegion as fallbacks when an InstanceSpec leaves Type /
 // Region blank. Labels are merged into every created instance's labels.
+// ContainerImage / Width / Height are consumed by the co-located local provider
+// (cloud providers ignore them — they fetch the image and resolution via
+// cloud-init on the instance instead).
 type Config struct {
 	Token         string
 	DefaultType   string
 	DefaultRegion string
 	Labels        map[string]string
+	// ContainerImage is the container (Docker) image a co-located provider (the
+	// local provider) runs per session, e.g. "ecu-image:dev". Cloud providers
+	// ignore it (they pull the image on the instance via cloud-init).
+	ContainerImage string
+	// Width/Height are the desktop resolution a co-located provider passes to
+	// the container (env WIDTH/HEIGHT). Zero means the provider's own default.
+	Width, Height int
 }
 
 // constructors holds the registered provider constructors keyed by lowercased

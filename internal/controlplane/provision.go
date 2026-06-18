@@ -59,20 +59,28 @@ func (s *Server) provisionSessionFromImage(sessionID, tunnelToken, bootImage str
 	defer cancel()
 
 	// 1. Render cloud-init carrying THIS session's tunnel token and the control
-	// plane's public tunnel URL. A render error means we never created an
-	// instance, so there is nothing to tear down.
-	userData, err := provider.RenderCloudInit(provider.CloudInitParams{
-		ControlPlaneURL: s.provisionCfg.TunnelURL,
-		TunnelToken:     tunnelToken,
-		ImageRef:        s.provisionCfg.ImageRef,
-		Width:           s.provisionCfg.Width,
-		Height:          s.provisionCfg.Height,
-		AgentBinaryURL:  s.provisionCfg.AgentBinaryURL,
-	})
-	if err != nil {
-		log.Printf("ecu provision: session %s: render cloud-init: %v", sessionID, err)
-		s.markErrorIfNotTerminated(sessionID)
-		return
+	// plane's public tunnel URL — but ONLY for providers that boot an instance
+	// that runs it (RequiresCloudInit). The local provider runs the container
+	// directly and is reached at Instance.Endpoint, so it needs no cloud-init:
+	// userData stays "" and neither RenderCloudInit nor its error path runs. A
+	// render error means we never created an instance, so there is nothing to
+	// tear down.
+	var userData string
+	if s.provider.RequiresCloudInit() {
+		ud, err := provider.RenderCloudInit(provider.CloudInitParams{
+			ControlPlaneURL: s.provisionCfg.TunnelURL,
+			TunnelToken:     tunnelToken,
+			ImageRef:        s.provisionCfg.ImageRef,
+			Width:           s.provisionCfg.Width,
+			Height:          s.provisionCfg.Height,
+			AgentBinaryURL:  s.provisionCfg.AgentBinaryURL,
+		})
+		if err != nil {
+			log.Printf("ecu provision: session %s: render cloud-init: %v", sessionID, err)
+			s.markErrorIfNotTerminated(sessionID)
+			return
+		}
+		userData = ud
 	}
 
 	// 2. Create the instance. BaseImage is the explicit bootImage: for a normal
@@ -113,8 +121,24 @@ func (s *Server) provisionSessionFromImage(sessionID, tunnelToken, bootImage str
 	}
 	log.Printf("ecu provision: session %s: instance %s created (ip=%s); awaiting agent", sessionID, inst.ID, inst.PublicIP)
 
-	// 4. Wait for readiness (the broker flips status to ready when the agent
-	// registers). On timeout, terminated, or store error -> teardown path.
+	// 4. Readiness. There are two shapes:
+	//
+	//   - Direct endpoint (inst.Endpoint != "", the local provider): the provider
+	//     already RAN the container and WAITED for its /healthz, so there is no
+	//     tunnel to await. Record the endpoint, then flip to ready (unless a
+	//     concurrent DELETE already terminated us, in which case we own teardown).
+	//   - Tunnel (inst.Endpoint == "", cloud providers): wait for the broker to
+	//     flip status to ready when the agent registers, with the existing
+	//     timeout / terminated / store-error handling.
+	//
+	// Teardown-on-failure applies to both shapes.
+	if inst.Endpoint != "" {
+		s.finishDirectProvision(sessionID, inst.ID, inst.Endpoint)
+		return
+	}
+
+	// Tunnel path: wait for readiness (the broker flips status to ready when the
+	// agent registers). On timeout, terminated, or store error -> teardown path.
 	switch s.waitForReady(ctx, sessionID) {
 	case readyReached:
 		log.Printf("ecu provision: session %s ready on instance %s", sessionID, inst.ID)
@@ -128,6 +152,41 @@ func (s *Server) provisionSessionFromImage(sessionID, tunnelToken, bootImage str
 		s.teardownInstance(sessionID, inst.ID)
 		s.markErrorIfNotTerminated(sessionID)
 	}
+}
+
+// finishDirectProvision completes provisioning for a provider that returned a
+// directly-reachable endpoint (the local Docker provider). The provider already
+// waited for the container's health, so instead of awaiting a tunnel we record
+// the endpoint and flip the session to ready — guarding against a concurrent
+// DELETE that terminated the session while we were creating the container. On
+// any failure the live container is torn down so it never leaks.
+func (s *Server) finishDirectProvision(sessionID, instanceID, endpoint string) {
+	// Record the direct tool-server endpoint so the proxy's direct transport can
+	// reach the container (there is no tunnel for a local session).
+	if err := s.store.UpdateSessionToolEndpoint(sessionID, endpoint); err != nil {
+		log.Printf("ecu provision: session %s: persist tool endpoint: %v", sessionID, err)
+		s.teardownInstance(sessionID, instanceID)
+		s.markErrorIfNotTerminated(sessionID)
+		return
+	}
+
+	// A concurrent DELETE may have terminated the session while we were bringing
+	// the container up. We hold the live container, so WE own its teardown in
+	// that race (DELETE backed off seeing no instance id, or raced the persist).
+	cur, found, err := s.store.GetSession(sessionID)
+	if err == nil && found && cur.Status == statusTerminated {
+		log.Printf("ecu provision: session %s terminated during provisioning; tearing down local container %s", sessionID, instanceID)
+		s.teardownInstance(sessionID, instanceID)
+		return
+	}
+
+	if s.markReadyIfStillProvisioning(sessionID) {
+		log.Printf("ecu provision: session %s ready on local container %s (direct endpoint)", sessionID, instanceID)
+		return
+	}
+	// Race set a non-provisioning, non-terminated state (unlikely). Nothing to
+	// do: we neither override it nor tear down a container the session may now be
+	// using.
 }
 
 // readyResult enumerates the outcome of waitForReady.
@@ -191,6 +250,24 @@ func (s *Server) teardownInstance(sessionID, instanceID string) {
 		return
 	}
 	log.Printf("ecu provision: session %s: instance %s destroyed", sessionID, instanceID)
+}
+
+// markReadyIfStillProvisioning flips a session to ready only if it is still
+// provisioning, so a concurrent DELETE (which sets terminated) is never
+// overridden. Returns true if it set ready.
+func (s *Server) markReadyIfStillProvisioning(sessionID string) bool {
+	cur, found, err := s.store.GetSession(sessionID)
+	if err != nil || !found {
+		return false
+	}
+	if cur.Status != statusProvisioning {
+		return false
+	}
+	if err := s.store.UpdateSessionStatus(sessionID, statusReady); err != nil {
+		log.Printf("ecu provision: session %s: mark ready: %v", sessionID, err)
+		return false
+	}
+	return true
 }
 
 // markErrorIfNotTerminated flips the session to error unless it has already

@@ -29,6 +29,10 @@ import (
 	// SDK stays confined to internal/provider/hcloud. Importing it here makes
 	// provider.New("hetzner", ...) work without the factory importing any SDK.
 	_ "github.com/backhand/ecu/internal/provider/hcloud"
+	// Blank import for its init(), which registers the "local" provider (runs
+	// each disposable desktop as a Docker container ON this control-plane box;
+	// selected via ECU_PROVIDER=local).
+	_ "github.com/backhand/ecu/internal/provider/local"
 	"github.com/backhand/ecu/internal/store"
 	"github.com/backhand/ecu/internal/tlsboot"
 )
@@ -144,6 +148,10 @@ func runControlPlane() error {
 	opts := []controlplane.ServerOption{
 		controlplane.WithExposeTunnelToken(exposeTunnelToken),
 		controlplane.WithListenAddr(cfg.Listen),
+		// The configured provider name gates provider-capability-specific behavior
+		// (notably rejecting persistence on the local provider). Applies in all
+		// modes, so it goes on the base opts.
+		controlplane.WithProviderName(cfg.Provider),
 		// C9 live watch: the HMAC secret for short-lived view tokens (empty ->
 		// random key generated in NewServer, which invalidates tokens across
 		// restarts; fine for minutes-long tokens) and the public base URL used to
@@ -179,9 +187,12 @@ func runControlPlane() error {
 	// built or required.
 	if cfg.DevToolServer == "" {
 		prov, err := provider.New(cfg.Provider, provider.Config{
-			Token:         cfg.HCloudToken,
-			DefaultType:   cfg.InstanceType,
-			DefaultRegion: cfg.Region,
+			Token:          cfg.HCloudToken,
+			DefaultType:    cfg.InstanceType,
+			DefaultRegion:  cfg.Region,
+			ContainerImage: cfg.ContainerImage,
+			Width:          0, // renderer/provider defaults to 1280x800
+			Height:         0,
 		})
 		if err != nil {
 			return err

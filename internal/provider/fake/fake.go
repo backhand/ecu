@@ -70,6 +70,19 @@ type Provider struct {
 	// spec.UserData — driving the session to ready. C7 bake tests also use it to
 	// fire the bake-completion callback once the bake instance is created.
 	OnCreate func(provider.InstanceSpec)
+
+	// CreateEndpoint, when non-empty, is copied into the Instance.Endpoint of
+	// every CreateInstance result (and the stored instance). It models the local
+	// provider's direct, tunnel-less tool-server endpoint, letting the
+	// direct-provision path (which skips cloud-init and the readiness wait) be
+	// tested with the fake provider.
+	CreateEndpoint string
+
+	// RequiresCloudInitResult overrides what RequiresCloudInit reports. nil (the
+	// default) means true — the cloud-provider behavior. Set it to point at
+	// false to model the local provider, exercising the no-cloud-init
+	// direct-provision branch.
+	RequiresCloudInitResult *bool
 }
 
 // ImageCall records a single CreateImage invocation.
@@ -109,6 +122,7 @@ func (p *Provider) CreateInstance(_ context.Context, spec provider.InstanceSpec)
 	inst := provider.Instance{
 		ID:       id,
 		PublicIP: fmt.Sprintf("203.0.113.%d", p.nextID),
+		Endpoint: p.CreateEndpoint,
 		Status:   "running",
 	}
 	p.creates = append(p.creates, spec)
@@ -207,6 +221,18 @@ func (p *Provider) EnsureFirewall(_ context.Context, rules []provider.FirewallRu
 	defer p.mu.Unlock()
 	p.firewalls = append(p.firewalls, rules)
 	return nil
+}
+
+// RequiresCloudInit reports RequiresCloudInitResult when set, else true (the
+// cloud-provider default). Tests pointing it at false model the local provider
+// to exercise the no-cloud-init direct-provision branch.
+func (p *Provider) RequiresCloudInit() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.RequiresCloudInitResult != nil {
+		return *p.RequiresCloudInitResult
+	}
+	return true
 }
 
 // CreateCount returns how many times CreateInstance was called (successfully).

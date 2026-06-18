@@ -64,6 +64,12 @@ type Server struct {
 	// provisions) and in C2/C3 tests that don't exercise provisioning.
 	provider provider.Provider
 
+	// providerName is the configured provider name (ECU_PROVIDER), used to gate
+	// provider-capability-specific behavior — notably rejecting persistent /
+	// restore requests on the local provider, which cannot snapshot. Empty in
+	// tests that don't set it; the gate only fires when it equals "local".
+	providerName string
+
 	// provisionCfg carries everything the production POST /sessions path needs
 	// to render cloud-init and create an instance (see ProvisionConfig).
 	provisionCfg ProvisionConfig
@@ -177,6 +183,13 @@ func WithProvider(p provider.Provider) ServerOption {
 // needs (cloud-init inputs, instance shape, and the readiness timeout).
 func WithProvisionConfig(cfg ProvisionConfig) ServerOption {
 	return func(s *Server) { s.provisionCfg = cfg }
+}
+
+// WithProviderName records the configured provider name (ECU_PROVIDER) so the
+// server can gate provider-capability-specific behavior, notably rejecting
+// persistent / restore requests on the local provider (which cannot snapshot).
+func WithProviderName(name string) ServerOption {
+	return func(s *Server) { s.providerName = name }
 }
 
 // WithBakeConfig supplies the C7 pre-bake settings (see BakeConfig). It is set

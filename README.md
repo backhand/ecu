@@ -18,7 +18,9 @@ session down when done.
   tool surface; the host model supplies all vision + reasoning. Drops in across
   platforms unchanged.
 - **Cloud-agnostic seam, Hetzner first.** All cloud ops go through a `Provider`
-  interface; Hetzner is the only implementation shipped initially.
+  interface; Hetzner provisions remote VMs, and a built-in `local` provider runs
+  each desktop as a Docker container on the control-plane box itself
+  (`ECU_PROVIDER=local`) for single-machine setups.
 
 > Status: under active development. Build follows the order in `references/BRIEF.md`.
 
@@ -34,7 +36,8 @@ ecu/
 │   ├── store/            # embedded SQLite
 │   ├── tunnel/           # WSS+yamux reverse tunnel (transport-swappable)
 │   └── provider/         # Provider interface
-│       └── hcloud/       # Hetzner implementation (only one shipped)
+│       ├── hcloud/       # Hetzner implementation (remote VMs)
+│       └── local/        # co-located Docker containers (ECU_PROVIDER=local)
 ├── image/                # instance container: Dockerfile + FastAPI tool server
 ├── skill/ecu-computer-use/   # SKILL.md, mcp_server.py, ecu_cli.py, ecu_client.py
 ├── deploy/k3s/           # Deployment + Service + Ingress + Secret manifests
@@ -90,6 +93,45 @@ well-known ports). Issued certificates are cached under `ECU_TLS_CACHE_DIR`
 **Dev / no TLS.** Leave `ECU_TLS` unset (or `=off`) and the control plane serves
 plain HTTP on `ECU_LISTEN` (default `127.0.0.1:8080`) — handy for local
 development and the mode you use behind a TLS-terminating proxy.
+
+### Single box (`ECU_PROVIDER=local`)
+
+For local development, a self-contained demo, or a single-machine deployment you
+don't have to provision cloud instances at all. With `ECU_PROVIDER=local` the
+control plane runs **each disposable desktop as a Docker container on the same
+box**, co-located with the control plane, instead of booting a remote VM. There
+is no reverse tunnel: the container's tool-server port is published bound to
+`127.0.0.1` and the control plane talks to it directly.
+
+Requirements: a working **Docker** daemon and the computer-use **container image
+available locally** (the control plane does not pull it). Build or pull it first,
+then point `ECU_CONTAINER_IMAGE` at it:
+
+```sh
+export ECU_API_KEY="$(openssl rand -hex 32)"   # bootstrap admin key
+export ECU_PROVIDER=local
+export ECU_CONTAINER_IMAGE=ecu-image:dev        # a desktop image present on this host
+
+ecu                                             # serves plain HTTP on ECU_LISTEN (127.0.0.1:8080)
+```
+
+A `POST /sessions` spins up a container (image's tool server comes up in seconds;
+the control plane waits for its `/healthz` before marking the session `ready`),
+and `screenshot` / `click` / `type` / `exec` / `actions` proxy straight to it.
+`DELETE /sessions/{id}` removes the container. No Hetzner token, instance type,
+or region is needed — only `ECU_API_KEY`.
+
+Notes and limits:
+
+- **Localhost-bound.** Every container's tool-server port is published with
+  `-p 127.0.0.1::8000`, so it is never reachable off-box. Front the control
+  plane itself with TLS/auth if you expose it.
+- **No persistence.** Snapshot-and-restore is a cloud-instance feature; on the
+  local provider a `persistent:true` or `restore` request is rejected with
+  `400 persistence is not supported with the local provider`. Ephemeral sessions
+  work normally.
+- The image is run with `--platform linux/amd64`; on an arm64 host it runs under
+  emulation (slower to boot, still works), which the readiness wait allows for.
 
 ### k3s
 

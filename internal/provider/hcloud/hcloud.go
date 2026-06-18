@@ -304,6 +304,10 @@ func (p *Provider) EnsureFirewall(ctx context.Context, rules []provider.Firewall
 	return nil
 }
 
+// RequiresCloudInit reports true: a Hetzner instance boots and runs cloud-init
+// to fetch the agent + container image and dial the reverse tunnel.
+func (p *Provider) RequiresCloudInit() bool { return true }
+
 // mergeLabels merges the factory labels and the spec labels, always including
 // ecu=managed so the managed firewall's label selector matches.
 func (p *Provider) mergeLabels(specLabels map[string]string) map[string]string {

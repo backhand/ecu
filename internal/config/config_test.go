@@ -280,6 +280,29 @@ func TestResolveNonHetznerProviderNoTokenRequired(t *testing.T) {
 	}
 }
 
+// TestResolveLocalProviderOnlyNeedsAPIKey verifies the local provider (which
+// runs containers on-box and provisions no cloud instance) requires only
+// ECU_API_KEY — no Hetzner token / type / region — and carries the provider
+// name through. ECU_CONTAINER_IMAGE is supplied because the local provider runs
+// it, but it is defaulted, so its presence is incidental here.
+func TestResolveLocalProviderOnlyNeedsAPIKey(t *testing.T) {
+	env := map[string]string{
+		"ECU_API_KEY":         "k",
+		"ECU_PROVIDER":        "local",
+		"ECU_CONTAINER_IMAGE": "ecu-image:dev",
+	}
+	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (local provider must need only ECU_API_KEY)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false: local provider needs only ECU_API_KEY")
+	}
+	if cfg.Provider != "local" {
+		t.Fatalf("cfg.Provider = %q, want %q", cfg.Provider, "local")
+	}
+}
+
 // TestResolveMissingWithTTY verifies that when the required key is missing but
 // a TTY is present, resolve signals that the wizard should run, without error.
 func TestResolveMissingWithTTY(t *testing.T) {

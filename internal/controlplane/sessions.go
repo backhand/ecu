@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/backhand/ecu/internal/store"
 )
@@ -91,6 +92,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	// An empty body is valid (all fields optional); only reject malformed JSON.
 	if err := decodeOptionalJSON(r.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	// Local provider gate: persistence (snapshot-and-restore) is a cloud-instance
+	// concept the local Docker provider cannot do, so reject any persistent OR
+	// restore request up front with 400. This fires BEFORE the persistent-capability
+	// check (which would be 403), because the capability is irrelevant when the
+	// provider can never honor the request. Ephemeral POST /sessions is unaffected.
+	if (req.Persistent || (req.Restore != nil && *req.Restore != "")) && strings.EqualFold(s.providerName, "local") {
+		writeError(w, http.StatusBadRequest, "persistence is not supported with the local provider")
 		return
 	}
 
