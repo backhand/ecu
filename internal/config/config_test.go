@@ -6,6 +6,80 @@ import (
 	"time"
 )
 
+// TestTLSConfigDefaultsOff verifies the C10 TLS knobs default safely: ECU_TLS
+// defaults to "off" (plain HTTP, the dev/Ingress-fronted default) and
+// ECU_TLS_CACHE_DIR defaults to the home-relative autocert cache, with the
+// leading ~ expanded. ECU_API_KEY + ECU_HCLOUD_TOKEN are set so the production
+// (hetzner) path does not fail-fast — we are exercising defaults, not the
+// required-key decision.
+func TestTLSConfigDefaultsOff(t *testing.T) {
+	env := map[string]string{"ECU_API_KEY": "k", "ECU_HCLOUD_TOKEN": "hc_tok"}
+
+	cfg, _, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v", err)
+	}
+	if cfg.TLS != "off" {
+		t.Fatalf("cfg.TLS = %q, want default %q", cfg.TLS, "off")
+	}
+	if cfg.TLS != defaultTLS {
+		t.Fatalf("cfg.TLS = %q, want defaultTLS %q", cfg.TLS, defaultTLS)
+	}
+	// The cache dir default is home-relative; expandHome must have stripped the
+	// leading ~ (an absolute path), and it must still end in the documented
+	// suffix.
+	if strings.HasPrefix(cfg.TLSCacheDir, "~") {
+		t.Fatalf("cfg.TLSCacheDir = %q still has an unexpanded ~ prefix", cfg.TLSCacheDir)
+	}
+	if !strings.HasSuffix(cfg.TLSCacheDir, "/.local/share/ecu/tls") {
+		t.Fatalf("cfg.TLSCacheDir = %q, want it to end in /.local/share/ecu/tls", cfg.TLSCacheDir)
+	}
+}
+
+// TestTLSConfigEnvOverride verifies ECU_TLS=auto is carried through verbatim and
+// that an explicit ECU_TLS_CACHE_DIR (env) overrides the default. Setting
+// ECU_TLS=auto must NOT make resolve require a hostname or fail-fast.
+func TestTLSConfigEnvOverride(t *testing.T) {
+	env := map[string]string{
+		"ECU_API_KEY":       "k",
+		"ECU_HCLOUD_TOKEN":  "hc_tok",
+		"ECU_TLS":           "auto",
+		"ECU_TLS_CACHE_DIR": "/var/lib/ecu/tls",
+	}
+
+	cfg, runWizard, err := resolve(env, nil, false /*isTTY*/, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v (ECU_TLS=auto must not add a required key)", err)
+	}
+	if runWizard {
+		t.Fatalf("runWizard = true, want false: ECU_TLS=auto must not force the wizard")
+	}
+	if cfg.TLS != "auto" {
+		t.Fatalf("cfg.TLS = %q, want %q (carried through verbatim)", cfg.TLS, "auto")
+	}
+	if cfg.TLSCacheDir != "/var/lib/ecu/tls" {
+		t.Fatalf("cfg.TLSCacheDir = %q, want the explicit env value", cfg.TLSCacheDir)
+	}
+}
+
+// TestTLSConfigPrecedenceEnvOverFile verifies env > file for ECU_TLS.
+func TestTLSConfigPrecedenceEnvOverFile(t *testing.T) {
+	env := map[string]string{
+		"ECU_API_KEY":        "k",
+		"ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+		"ECU_TLS":            "auto",
+	}
+	fileCfg := &Config{TLS: "off"}
+
+	cfg, _, err := resolve(env, fileCfg, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve returned error: %v", err)
+	}
+	if cfg.TLS != "auto" {
+		t.Fatalf("cfg.TLS = %q, want env value %q (env must override file)", cfg.TLS, "auto")
+	}
+}
+
 // TestResolveEnvPresent verifies that when the required keys are present in the
 // environment, resolve returns runWizard=false, no error, and the key is in the
 // resolved config. The default provider is hetzner and no dev tool-server is

@@ -1,0 +1,48 @@
+# Build context excludes for the control-plane image (Dockerfile at repo root).
+# The control-plane build needs only go.mod/go.sum and the Go source under
+# cmd/ and internal/; everything below is irrelevant to it and only bloats the
+# context (or leaks local state), so keep it out.
+
+# VCS + editor/OS cruft.
+.git/
+.gitignore
+.DS_Store
+
+# Local control-plane state / secrets — never ship these into a layer.
+*.db
+*.sqlite
+*.sqlite3
+*.env
+.env
+ecu.config
+ecu.config.*
+secrets/
+
+# Go build output (the binary is produced inside the builder stage).
+/ecu
+dist/
+*.test
+*.out
+
+# Spec / working drafts — reference material, not build inputs.
+references/
+
+# Packaging + deploy artifacts that are not Go build inputs.
+install.sh
+deploy/
+
+# The instance (computer-use) image build context — a SEPARATE image
+# (image/Dockerfile); not needed to build the control-plane binary.
+image/
+
+# The skill (Python) — not a control-plane build input.
+skill/
+
+# Python caches (from the skill / tool server).
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docs that are not build inputs.
+*.md

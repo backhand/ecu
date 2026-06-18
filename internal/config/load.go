@@ -135,6 +135,8 @@ func readFileConfig(path string) (*Config, error) {
 func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 	c := &Config{
 		Hostname:              fc.Hostname,
+		TLS:                   fc.TLS,
+		TLSCacheDir:           fc.TLSCacheDir,
 		Listen:                fc.Listen,
 		APIKey:                fc.APIKey,
 		SigningKey:            fc.SigningKey,
@@ -229,6 +231,8 @@ func writeFileConfig(path string, cfg *Config) error {
 func configToFileConfig(cfg *Config) *fileConfig {
 	fc := &fileConfig{
 		Hostname:              cfg.Hostname,
+		TLS:                   cfg.TLS,
+		TLSCacheDir:           cfg.TLSCacheDir,
 		Listen:                cfg.Listen,
 		APIKey:                cfg.APIKey,
 		SigningKey:            cfg.SigningKey,

@@ -1,0 +1,18 @@
+# ClusterIP Service fronting the control-plane pod. The Ingress routes to this
+# Service; nothing external talks to it directly. Port 80 -> the pod's named
+# "http" port (containerPort 8080).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecu-controlplane
+  labels:
+    app: ecu-controlplane
+spec:
+  type: ClusterIP
+  selector:
+    app: ecu-controlplane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

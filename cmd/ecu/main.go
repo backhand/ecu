@@ -30,6 +30,7 @@ import (
 	// provider.New("hetzner", ...) work without the factory importing any SDK.
 	_ "github.com/backhand/ecu/internal/provider/hcloud"
 	"github.com/backhand/ecu/internal/store"
+	"github.com/backhand/ecu/internal/tlsboot"
 )
 
 func main() {
@@ -251,12 +252,10 @@ func runControlPlane() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Plain HTTP on ECU_LISTEN; automatic TLS is Component 10.
-	httpServer := &http.Server{Addr: cfg.Listen, Handler: handler}
-
 	// The reaper sweeps idle/lifetime/orphan sessions and destroys leaked
 	// instances. It runs in dev mode too (teardown is a no-op without a
-	// provider, but idle/lifetime reaping still applies).
+	// provider, but idle/lifetime reaping still applies). It runs regardless of
+	// TLS mode.
 	go srv.RunReaper(ctx)
 
 	// C7 pre-baking: when ECU_IMAGE is set, find an existing snapshot or kick off
@@ -264,8 +263,37 @@ func runControlPlane() error {
 	// configured (dev mode). The bake runs in the background so the control plane
 	// is usable immediately; sessions during a bake cold-boot. ctx is the server
 	// lifecycle context so shutdown aborts an in-flight bake (its temp instance is
-	// still torn down by the baker's deferred teardown).
+	// still torn down by the baker's deferred teardown). Runs regardless of TLS
+	// mode.
 	srv.StartBake(ctx)
+
+	// Serve. Two paths, selected by ECU_TLS:
+	//
+	//   - "auto": the C10 autocert path (internal/tlsboot). It obtains Let's
+	//     Encrypt certificates over the HTTP-01 challenge and serves HTTPS on
+	//     :443 with the challenge + an HTTP->HTTPS redirect on :80. This IGNORES
+	//     ECU_LISTEN — autocert must bind the well-known ports for HTTP-01
+	//     validation. tlsboot.Serve blocks until ctx is cancelled (or a listener
+	//     fails) and handles its own graceful shutdown; we return its error so a
+	//     fatal (e.g. "auto but no hostname resolvable", or :443 already in use)
+	//     exits non-zero.
+	//   - "off" (default): plain HTTP on ECU_LISTEN, exactly as before. This is
+	//     the dev default AND the production path behind a TLS-terminating
+	//     fronting layer — notably the k3s deployment, where the traefik Ingress
+	//     terminates TLS and the pod runs ECU_TLS=off (so no privileged :443/:80
+	//     bind is needed in-cluster). The agent tunnel (/agent/connect) and live
+	//     watch (/sessions/{id}/watch) ride this same handler over WebSocket.
+	if tlsboot.Enabled(cfg.TLS) {
+		log.Printf("ecu: TLS mode=auto (autocert, HTTP-01); serving HTTPS :443, HTTP-01+redirect :80 (ECU_LISTEN ignored)")
+		return tlsboot.Serve(ctx, handler, tlsboot.Options{
+			Mode:     cfg.TLS,
+			Hostname: cfg.Hostname,
+			CacheDir: cfg.TLSCacheDir,
+		})
+	}
+
+	log.Printf("ecu: TLS mode=off; serving plain HTTP on %s (terminate TLS at a fronting Ingress/LB, or set ECU_TLS=auto for built-in autocert)", cfg.Listen)
+	httpServer := &http.Server{Addr: cfg.Listen, Handler: handler}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()

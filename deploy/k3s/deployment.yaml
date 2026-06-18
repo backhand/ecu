@@ -1,0 +1,104 @@
+# ECU control-plane Deployment (+ its PersistentVolumeClaim).
+#
+# SINGLETON: the control plane is stateful — it owns an embedded SQLite database
+# and an IN-MEMORY tunnel registry (the live agent connections). A second
+# replica would have its own empty registry and a separate DB, so sessions
+# created against one pod are invisible to the other and tunnels break. Keep
+# replicas: 1. Do NOT scale this horizontally; the strategy below is Recreate so
+# a rollout never runs two pods at once contending for the single RWO volume.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecu-controlplane
+  labels:
+    app: ecu-controlplane
+spec:
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate): the PVC is ReadWriteOnce and the process is a
+    # singleton, so the old pod must fully terminate before the new one starts.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ecu-controlplane
+  template:
+    metadata:
+      labels:
+        app: ecu-controlplane
+    spec:
+      securityContext:
+        # Matches the distroless ":nonroot" image (uid/gid 65532). fsGroup makes
+        # the mounted PVC group-owned by — and writable by — the nonroot user, so
+        # the SQLite DB at /data is writable without running as root.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: ecu
+          # Placeholder; push/pull your built control-plane image here.
+          image: ghcr.io/backhand/ecu-controlplane:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # TLS is terminated by the Ingress (traefik/cert-manager), so the pod
+            # itself serves PLAIN HTTP — no autocert, no privileged :443/:80 bind
+            # in-cluster. (The autocert path, ECU_TLS=auto, is for the standalone
+            # binary, not this deployment.)
+            - name: ECU_TLS
+              value: "off"
+            # Bind all interfaces so the Service/Ingress can reach the pod (the
+            # app default 127.0.0.1 would only be reachable from inside the pod).
+            - name: ECU_LISTEN
+              value: "0.0.0.0:8080"
+            # SQLite DB on the persistent volume mounted at /data.
+            - name: ECU_DB
+              value: "/data/ecu.db"
+            # Public hostname used to build tunnel/watch/callback URLs. Must match
+            # the Ingress host (see ingress.yaml). Replace with your real host.
+            - name: ECU_HOSTNAME
+              value: "ecu.example.com"
+          # Secret-sourced env: the admin key, the Hetzner token, and the watch
+          # signing key all come from the ecu-secrets Secret (see secret.yaml).
+          envFrom:
+            - secretRef:
+                name: ecu-secrets
+          # There is no UNAUTHENTICATED health endpoint (every API route requires
+          # the admin key, and /sessions returns 401 without it), so probe the
+          # listening TCP port rather than an HTTP path.
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ecu-data
+---
+# Persistent storage for the SQLite DB + key store. An emptyDir would work for
+# ephemeral/testing use, but it is LOST on pod restart — taking the seeded admin
+# key state and all session/persistence records with it. Use a real PVC so state
+# survives restarts and rollouts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ecu-data
+  labels:
+    app: ecu-controlplane
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

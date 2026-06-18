@@ -28,6 +28,17 @@ const (
 	defaultMaxPersistentSessions = 3
 	defaultDBPath                = "~/.local/share/ecu/ecu.db"
 	defaultConfigPath            = "~/.config/ecu/config.json"
+	// defaultTLS is the automatic-TLS mode (ECU_TLS). It is "off" by default:
+	// the control plane serves plain HTTP on ECU_LISTEN and an operator (or a
+	// fronting Ingress / load balancer) terminates TLS. The "auto" mode opts into
+	// the built-in autocert (Let's Encrypt, HTTP-01) path wired in C10.
+	defaultTLS = "off"
+	// defaultTLSCacheDir is where autocert persists issued certificates and the
+	// account key (ECU_TLS_CACHE_DIR). It mirrors defaultDBPath's "~/.local/share"
+	// home-relative layout; the leading ~ is expanded in resolve. Persisting the
+	// cache across restarts is what keeps the control plane from re-requesting a
+	// certificate (and burning Let's Encrypt rate limit) on every boot.
+	defaultTLSCacheDir = "~/.local/share/ecu/tls"
 	// defaultProvisionTimeout bounds how long the control plane waits for a
 	// freshly provisioned instance's agent to register before tearing the
 	// instance down (C4). A cold boot pulls a container image, so minutes.
@@ -73,6 +84,21 @@ type Config struct {
 	// Hostname is the public hostname used for TLS (ECU_HOSTNAME). Consumed by
 	// the TLS/packaging component (C10), stored now.
 	Hostname string
+
+	// TLS selects the automatic-TLS mode (ECU_TLS): "auto" or "off". Defaults to
+	// defaultTLS ("off"). In "off" mode the control plane serves plain HTTP on
+	// Listen — the dev default, and the production path behind a TLS-terminating
+	// Ingress/load balancer. In "auto" mode it ignores Listen and runs the C10
+	// autocert path: HTTPS on :443 with Let's Encrypt certificates obtained via
+	// the HTTP-01 challenge on :80. Consumed by C10 (internal/tlsboot).
+	TLS string
+
+	// TLSCacheDir is the on-disk directory autocert uses to cache issued
+	// certificates and its account key (ECU_TLS_CACHE_DIR). Defaults to
+	// defaultTLSCacheDir; a leading ~ is expanded. Only consulted in TLS "auto"
+	// mode. Persisting it across restarts avoids re-issuing certificates (and
+	// hitting Let's Encrypt rate limits) on every boot. Consumed by C10.
+	TLSCacheDir string
 
 	// Listen is the address the control-plane HTTP server binds to
 	// (ECU_LISTEN). Defaults to defaultListen.
@@ -208,6 +234,8 @@ type Config struct {
 // value. resolve and the wizard convert between fileConfig and Config.
 type fileConfig struct {
 	Hostname              string `json:"hostname,omitempty"`
+	TLS                   string `json:"tls,omitempty"`
+	TLSCacheDir           string `json:"tls_cache_dir,omitempty"`
 	Listen                string `json:"listen,omitempty"`
 	APIKey                string `json:"api_key,omitempty"`
 	SigningKey            string `json:"signing_key,omitempty"`
@@ -328,6 +356,7 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 
 	// String settings: env > file > default.
 	c.Hostname = pick(env["ECU_HOSTNAME"], fileCfg.Hostname)
+	c.TLS = pick(env["ECU_TLS"], fileCfg.TLS, defaultTLS)
 	c.Listen = pick(env["ECU_LISTEN"], fileCfg.Listen, defaultListen)
 	c.APIKey = pick(env["ECU_API_KEY"], fileCfg.APIKey)
 	c.SigningKey = pick(env["ECU_SIGNING_KEY"], fileCfg.SigningKey)
@@ -436,10 +465,14 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	// Path settings: env > file > default, then expand ~.
 	c.DBPath = pick(env["ECU_DB"], fileCfg.DBPath, defaultDBPath)
 	c.ConfigPath = pick(env["ECU_CONFIG"], fileCfg.ConfigPath, defaultConfigPath)
+	c.TLSCacheDir = pick(env["ECU_TLS_CACHE_DIR"], fileCfg.TLSCacheDir, defaultTLSCacheDir)
 	if c.DBPath, err = expandHome(c.DBPath); err != nil {
 		return nil, false, err
 	}
 	if c.ConfigPath, err = expandHome(c.ConfigPath); err != nil {
+		return nil, false, err
+	}
+	if c.TLSCacheDir, err = expandHome(c.TLSCacheDir); err != nil {
 		return nil, false, err
 	}
 

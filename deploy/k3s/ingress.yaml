@@ -1,0 +1,58 @@
+# Ingress for the control plane. k3s ships traefik as the default ingress
+# controller, so no ingressClassName is required (traefik claims it); set one if
+# your cluster uses a different controller.
+#
+# TLS TERMINATION HAPPENS HERE. The Ingress presents the certificate and speaks
+# HTTPS to clients; it forwards plain HTTP to the pod (which runs ECU_TLS=off).
+# Two ways to obtain the cert referenced by the tls block below — pick ONE:
+#
+#   (a) cert-manager (recommended): install cert-manager + a ClusterIssuer named
+#       letsencrypt-prod, then uncomment the cert-manager annotation. cert-manager
+#       watches this Ingress and provisions/renews the `ecu-tls` Secret for you.
+#
+#   (b) traefik's built-in ACME: configure traefik's certresolver
+#       (certificatesResolvers) in its static/helm config and annotate this
+#       Ingress with traefik.ingress.kubernetes.io/router.tls.certresolver.
+#
+# WEBSOCKET: the agent tunnel (GET /agent/connect) and live watch
+# (GET /sessions/{id}/watch) ride WebSocket. traefik proxies WebSocket
+# transparently (it forwards the Upgrade/Connection headers by default), so NO
+# special annotation is needed for WS to work through this Ingress — but it is
+# called out explicitly here so nobody adds (or removes) config thinking WS
+# needs it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ecu-controlplane
+  labels:
+    app: ecu-controlplane
+  annotations:
+    # (a) cert-manager — uncomment to have cert-manager fill the ecu-tls Secret:
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # (b) traefik built-in ACME — uncomment if using traefik's own resolver:
+    # traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
+    {}
+spec:
+  tls:
+    # Replace the host with your real DNS name (must match ECU_HOSTNAME in the
+    # Deployment). The cert is stored in the `ecu-tls` Secret — created by
+    # cert-manager (a) or supplied manually; traefik's resolver (b) manages its
+    # own store and ignores secretName.
+    - hosts:
+        - ecu.example.com
+      secretName: ecu-tls
+  rules:
+    # Replace ecu.example.com with your host. Point a DNS A record at the
+    # Ingress's external IP / load balancer.
+    - host: ecu.example.com
+      http:
+        paths:
+          # Route every path to the control plane (the API, the WebSocket tunnel
+          # at /agent/connect, and the watch endpoint all share one handler).
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ecu-controlplane
+                port:
+                  name: http
