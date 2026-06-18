@@ -33,6 +33,7 @@ import asyncio
 import base64
 import io
 import os
+import shlex
 import subprocess
 import threading
 from typing import Literal
@@ -124,6 +125,80 @@ app = FastAPI(title="ECU tool server", version="1")
 _computer = ComputerTool()
 _computer._scaling_enabled = False
 
+# --- input must never block on a capture (protocol #4) ---------------------
+#
+# Two demo behaviours made a single /click take ~18 s on this headless desktop —
+# input that was, in effect, blocking on a capture on every action. Measured in
+# the container: xdotool click alone is ~0.15 s, but a /click was ~18 s.
+#
+#   (1) Post-action capture. Every demo action ends in
+#       ``ComputerTool.shell(cmd)`` with the DEFAULT ``take_screenshot=True``,
+#       which after the xdotool command does ``await asyncio.sleep(2 s)`` and a
+#       FULL ``screenshot()`` the tool server then throws away (we capture frames
+#       only on the explicit /screenshot path). ~2 s + a grab per action.
+#
+#   (2) ``mousemove --sync``. The demo builds click/move as
+#       ``xdotool mousemove --sync X Y ...``. ``--sync`` blocks until the X
+#       server acks the pointer reaching the target; under this Xvfb + mutter it
+#       hangs ~16 s PER action (the dominant cost — measured: with ``--sync``
+#       ~16.5 s, without it ~0.15 s, identical otherwise).
+#
+# Both are baked into the demo's ``__call__``/``shell``, so we drive xdotool
+# OURSELVES for the input endpoints: build the same commands but WITHOUT
+# ``--sync`` and WITHOUT a post-action capture, and run them through the demo's
+# async ``shell`` (``asyncio.create_subprocess_shell`` -> non-blocking). Input
+# handlers then cost only the xdotool subprocess (~tens of ms) and hold no lock
+# the capture path needs, so they stay sub-100 ms even during a screenshot storm.
+#
+# The /screenshot path is unchanged: it captures via ``screenshot()`` directly
+# (``_capture_png`` -> ``action="screenshot"``), which we keep going through the
+# demo tool. We also force ``shell`` to never auto-capture and zero the settle
+# delay as belt-and-braces for any demo path that still routes through ``shell``
+# (e.g. ``type``'s trailing screenshot is suppressed; the chunked type shells
+# already passed ``take_screenshot=False``).
+_computer._screenshot_delay = 0
+
+_demo_shell = _computer.shell
+
+
+async def _shell_no_capture(command: str, take_screenshot: bool = True):
+    # Force take_screenshot=False regardless of the caller: no action needs the
+    # demo's post-command sleep+screenshot, and the tool server captures frames
+    # only on the explicit /screenshot path.
+    return await _demo_shell(command, take_screenshot=False)
+
+
+_computer.shell = _shell_no_capture  # type: ignore[method-assign]
+
+# xdotool prefix (DISPLAY set), mirrored from the demo tool so our hand-built
+# input commands target the same X display.
+_XDOTOOL = f"DISPLAY={DISPLAY} xdotool"
+
+
+async def _xdotool(args: str) -> None:
+    """Run an ``xdotool <args>`` command on the desktop, fast and capture-free.
+
+    Goes through the demo's async ``shell`` (now forced to never auto-capture),
+    which runs the subprocess via ``asyncio.create_subprocess_shell`` so the
+    event loop keeps serving other requests (input + screenshots interleave).
+    Deliberately omits ``mousemove --sync`` — the sync ack hangs ~16 s here and
+    is unnecessary: a screenshot taken afterwards already reflects the move. We
+    surface only hard failures; xdotool's stderr on a successful move is benign.
+    """
+    result = await _demo_shell(f"{_XDOTOOL} {args}", take_screenshot=False)
+    # xdotool is silent on success; any stderr means a real failure (bad key
+    # name, display down, ...). Surface it as a tool error (same strictness the
+    # demo applied to imageless action results).
+    err = (getattr(result, "error", None) or "").strip()
+    if err:
+        raise ToolActionError(err)
+
+
+# xdotool button numbers for the pointer buttons we expose.
+_XBUTTON = {"left": 1, "middle": 2, "right": 3}
+# xdotool wheel-button numbers for scrolling (up/down/left/right).
+_XSCROLL = {"up": 4, "down": 5, "left": 6, "right": 7}
+
 
 class _FrameState:
     """The instance's single base frame: encoded bytes, decoded pixels, token.
@@ -179,33 +254,78 @@ _frames = _FrameState()
 
 
 class ToolActionError(Exception):
-    """Raised when the wrapped ComputerTool reports an error."""
-
-
-async def _computer_action(**kwargs) -> object:
-    """Invoke the demo ComputerTool and surface tool-level errors.
-
-    ``ComputerTool.__call__`` is async and returns a ``ToolResult`` (frozen
-    dataclass with .output/.error/.base64_image) or raises ``ToolError``.
-    """
-    try:
-        result = await _computer(**kwargs)
-    except Exception as exc:  # ToolError and friends
-        raise ToolActionError(str(getattr(exc, "message", exc))) from exc
-    # A populated .error with no image generally means the xdotool/scrot call
-    # failed (e.g. display not up). Treat it as an error for action endpoints.
-    if getattr(result, "error", None) and not getattr(result, "base64_image", None):
-        raise ToolActionError(result.error or "tool error")
-    return result
+    """Raised when an input action or capture reports an error."""
 
 
 async def _capture_png() -> bytes:
-    """Take a screenshot via the demo tool and return raw PNG bytes."""
+    """Take a screenshot via the demo tool and return raw PNG bytes.
+
+    The demo's ``ComputerTool.screenshot()`` spawns the capture (gnome-screenshot
+    / scrot) as an *async* subprocess (``tools/run.py`` uses
+    ``asyncio.create_subprocess_shell`` + ``await communicate()``), so the actual
+    grab already yields the event loop. The one synchronous slice it still runs
+    on the loop is reading the ~1 MB PNG back off disk (``path.read_bytes()``).
+    That is cheap for one capture but multiplies under concurrent screenshot
+    load; the SCREENSHOT-ONLY capture gate (see ``_CaptureGate``) bounds it by
+    collapsing concurrent screenshot requests onto a single in-flight grab.
+    Input handlers never go through here, so they never pay for capture.
+    """
     result = await _computer(action="screenshot")
     b64 = getattr(result, "base64_image", None)
     if not b64:
         raise ToolActionError(getattr(result, "error", None) or "screenshot failed")
     return base64.b64decode(b64)
+
+
+class _CaptureGate:
+    """Single-flight gate for SCREENSHOT capture only (protocol #4).
+
+    The single-tenant desktop has exactly one framebuffer, so launching N
+    simultaneous ``scrot`` processes for N concurrent ``/screenshot`` requests is
+    pure waste — and, worse, each capture's synchronous tail (reading the PNG off
+    disk) runs on the event loop, so N of them pile up and can starve the loop
+    that input handlers also need. This was the live failure: a ``/click`` queued
+    behind a burst of in-flight screenshots and timed out at 60 s.
+
+    The gate coalesces concurrent capture requests onto a single in-flight grab:
+    the first caller launches the capture; everyone who asks while it is running
+    awaits that SAME capture and gets its bytes (the freshly captured frame).
+    Once it resolves the gate is clear and the next request starts a new grab —
+    so a screenshot is never served stale beyond one coalesced batch.
+
+    Crucially this lock lives ONLY on the ``/screenshot`` path. Input handlers
+    (``/click`` etc.) acquire NOTHING here, so they are never blocked by a
+    capture: input stays sub-100 ms even under a screenshot storm.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._inflight: "asyncio.Future[bytes] | None" = None
+
+    async def capture(self) -> bytes:
+        # Fast path: a capture is already running — await its result instead of
+        # launching a second scrot. We snapshot the future under the lock, then
+        # await it OUTSIDE the lock so a waiter never holds the lock (which would
+        # serialize the next batch behind this one).
+        async with self._lock:
+            inflight = self._inflight
+            if inflight is None:
+                inflight = asyncio.ensure_future(_capture_png())
+                self._inflight = inflight
+                leader = True
+            else:
+                leader = False
+        try:
+            return await inflight
+        finally:
+            if leader:
+                # Clear the slot so the next request triggers a fresh capture.
+                async with self._lock:
+                    if self._inflight is inflight:
+                        self._inflight = None
+
+
+_capture_gate = _CaptureGate()
 
 
 # --- diff protocol helpers (Component 6) -----------------------------------
@@ -405,12 +525,6 @@ class ExecBody(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-_CLICK_ACTION = {
-    "left": "left_click",
-    "right": "right_click",
-    "middle": "middle_click",
-}
-
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
@@ -552,7 +666,10 @@ async def screenshot(body: ScreenshotBody) -> JSONResponse:
     complete frame before showing it to a model (it never sees a diff).
     """
     try:
-        png = await _capture_png()
+        # Capture through the single-flight gate so concurrent /screenshot
+        # requests collapse onto one scrot (and never starve the loop that input
+        # handlers need). Input endpoints do NOT use the gate.
+        png = await _capture_gate.capture()
     except ToolActionError as exc:
         return _err(str(exc))
 
@@ -598,10 +715,10 @@ async def screenshot(body: ScreenshotBody) -> JSONResponse:
 
 @app.post("/click")
 async def click(body: ClickBody) -> JSONResponse:
+    # Move-then-click in one xdotool invocation, WITHOUT --sync (which hangs ~16 s
+    # on this WM) and WITHOUT the demo's post-action capture. ~0.15 s vs ~18 s.
     try:
-        await _computer_action(
-            action=_CLICK_ACTION[body.button], coordinate=[body.x, body.y]
-        )
+        await _xdotool(f"mousemove {body.x} {body.y} click {_XBUTTON[body.button]}")
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -610,7 +727,7 @@ async def click(body: ClickBody) -> JSONResponse:
 @app.post("/move")
 async def move(body: MoveBody) -> JSONResponse:
     try:
-        await _computer_action(action="mouse_move", coordinate=[body.x, body.y])
+        await _xdotool(f"mousemove {body.x} {body.y}")
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -618,8 +735,11 @@ async def move(body: MoveBody) -> JSONResponse:
 
 @app.post("/type")
 async def type_(body: TypeBody) -> JSONResponse:
+    # `xdotool type --delay 12` mirrors the demo's typing cadence, but built
+    # directly so it skips the demo's trailing full screenshot (an input action
+    # must not capture). The text is shlex-quoted; xdotool handles long strings.
     try:
-        await _computer_action(action="type", text=body.text)
+        await _xdotool(f"type --delay 12 -- {shlex.quote(body.text)}")
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -627,10 +747,10 @@ async def type_(body: TypeBody) -> JSONResponse:
 
 @app.post("/key")
 async def key(body: KeyBody) -> JSONResponse:
-    # Maps to the demo's "key" action -> `xdotool key -- <keys>`. xdotool
-    # syntax, e.g. "ctrl+l", "Return", "alt+F4".
+    # `xdotool key -- <keys>`: xdotool chord syntax, e.g. "ctrl+l", "Return",
+    # "alt+F4". Direct (no post-action capture); key has no --sync to worry about.
     try:
-        await _computer_action(action="key", text=body.keys)
+        await _xdotool(f"key -- {body.keys}")
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()
@@ -638,27 +758,29 @@ async def key(body: KeyBody) -> JSONResponse:
 
 @app.post("/scroll")
 async def scroll(body: ScrollBody) -> JSONResponse:
-    """Map dx/dy onto the demo's scroll action.
+    """Scroll at (x, y): one wheel-button burst per nonzero axis.
 
-    The demo scroll takes coordinate + scroll_direction + scroll_amount, so we
-    emit one scroll per nonzero axis: dy>0 down / dy<0 up, dx>0 right / dx<0
-    left, amount = abs(value).
+    Mirrors the demo's scroll (move to the anchor, then ``click --repeat N
+    <wheel-button>``: dy>0 down / dy<0 up, dx>0 right / dx<0 left) but built
+    directly so it skips ``mousemove --sync`` (the ~16 s hang) and the demo's
+    post-action capture. Both axes go in ONE xdotool call so the move applies to
+    both bursts.
     """
+    parts = [f"mousemove {body.x} {body.y}"]
+    if body.dy:
+        parts.append(
+            f"click --repeat {abs(body.dy)} "
+            f"{_XSCROLL['down'] if body.dy > 0 else _XSCROLL['up']}"
+        )
+    if body.dx:
+        parts.append(
+            f"click --repeat {abs(body.dx)} "
+            f"{_XSCROLL['right'] if body.dx > 0 else _XSCROLL['left']}"
+        )
+    if len(parts) == 1:
+        return _ok()  # no-op scroll (dx==dy==0): nothing to do
     try:
-        if body.dy:
-            await _computer_action(
-                action="scroll",
-                coordinate=[body.x, body.y],
-                scroll_direction="down" if body.dy > 0 else "up",
-                scroll_amount=abs(body.dy),
-            )
-        if body.dx:
-            await _computer_action(
-                action="scroll",
-                coordinate=[body.x, body.y],
-                scroll_direction="right" if body.dx > 0 else "left",
-                scroll_amount=abs(body.dx),
-            )
+        await _xdotool(" ".join(parts))
     except ToolActionError as exc:
         return _err(str(exc))
     return _ok()

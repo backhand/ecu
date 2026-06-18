@@ -27,10 +27,18 @@ image/
 └── README.md
 ```
 
-The tool server **wraps, never reimplements**, the demo's input/action logic.
-Every GUI action is forwarded to `ComputerTool` (the newest concrete class in
-the image, `ComputerTool20251124`, driving `xdotool`/`scrot`). Only `/exec`
-(plain `sh -c`) and `/screenshot` framing add local logic.
+The tool server leans on the demo's stack (`ComputerTool20251124`, driving
+`xdotool`/`scrot`) but keeps **input decoupled from capture** (protocol #4).
+`/screenshot` captures via the demo's `ComputerTool.screenshot()`; `/exec` is a
+plain `sh -c`. The input endpoints (`/click`,`/move`,`/type`,`/key`,`/scroll`)
+issue `xdotool` directly rather than through `ComputerTool.__call__`, dropping
+two demo behaviours that made a bare action take ~18 s on this headless desktop:
+the post-action `sleep(2 s)+screenshot` every action performed, and the
+`mousemove --sync` ack that hangs ~16 s under Xvfb+mutter. With those gone an
+action is just the `xdotool` subprocess (~tens of ms) and never blocks on a
+capture — even while `/screenshot` is mid-flight. A separate single-flight gate
+on `/screenshot` collapses concurrent captures onto one `scrot`; input touches
+none of it.
 
 ## Endpoint contract
 

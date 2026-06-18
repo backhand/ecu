@@ -31,6 +31,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -559,6 +561,148 @@ class McpServerTest(unittest.TestCase):
         self.assertEqual(name, "scroll")
         self.assertAlmostEqual(scale, 2.0)
         self.assertEqual((dx, dy), (1, 2))
+
+
+# --------------------------------------------------------------------------
+# Protocol #4 (client side): per-session request serialization
+# --------------------------------------------------------------------------
+
+class SerializationClient(ECUClient):
+    """ECUClient that exercises the REAL per-session lock.
+
+    It overrides ``_do_request`` (the inner HTTP call), NOT ``_request``, so the
+    lock-acquiring ``_request`` -> ``_serialize`` wrapper is genuinely run. Each
+    inner call records concurrency per session: it bumps an active-counter for
+    the session, sleeps a beat so overlapping calls actually coexist in time,
+    tracks the max concurrency ever seen for that session, then decrements. If
+    the lock works, same-session max concurrency stays at 1.
+    """
+
+    def __init__(self, hold: float = 0.05):
+        super().__init__(base_url="https://ecu.test", api_key="k_test")
+        self._hold = hold
+        self._counter_guard = threading.Lock()
+        self.active: dict[str, int] = {}       # session_id -> currently inside
+        self.max_active: dict[str, int] = {}   # session_id -> peak concurrency
+        self.global_active = 0
+        self.global_max = 0
+
+    def _do_request(self, method, path, **kwargs):  # type: ignore[override]
+        sid = self._session_id_from_path(path) or "<none>"
+        with self._counter_guard:
+            self.active[sid] = self.active.get(sid, 0) + 1
+            self.max_active[sid] = max(self.max_active.get(sid, 0), self.active[sid])
+            self.global_active += 1
+            self.global_max = max(self.global_max, self.global_active)
+        try:
+            time.sleep(self._hold)  # hold the (per-session) lock long enough to overlap
+            return {"ok": True}
+        finally:
+            with self._counter_guard:
+                self.active[sid] -= 1
+                self.global_active -= 1
+
+
+def _run_concurrently(targets):
+    """Start one thread per callable, run them all, and join."""
+    threads = [threading.Thread(target=t) for t in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+class PerSessionSerializationTest(unittest.TestCase):
+    def test_same_session_requests_are_serialized(self):
+        """N concurrent calls to the SAME session never overlap: the per-session
+        lock keeps max observed concurrency at exactly 1 (no two requests to one
+        session are ever in flight together)."""
+        client = SerializationClient(hold=0.05)
+        n = 6
+        _run_concurrently([
+            (lambda: client.click("s1", 1, 2)) for _ in range(n)
+        ])
+        # Never more than one request in flight at a time for s1.
+        self.assertEqual(client.max_active.get("s1"), 1,
+                         "two requests to the same session overlapped — not serialized")
+
+    def test_different_sessions_run_in_parallel(self):
+        """Different sessions are NOT serialized against each other: requests to
+        s1 and s2 overlap in time (global peak concurrency > 1), proving the lock
+        is per-session, not global."""
+        client = SerializationClient(hold=0.1)
+        # Two threads, different sessions, fired together — they must coexist.
+        _run_concurrently([
+            (lambda: client.click("s1", 1, 1)),
+            (lambda: client.move("s2", 2, 2)),
+        ])
+        # Each session saw at most one in-flight (trivially true: one call each)...
+        self.assertEqual(client.max_active.get("s1"), 1)
+        self.assertEqual(client.max_active.get("s2"), 1)
+        # ...but globally the two ran concurrently — different sessions parallelize.
+        self.assertEqual(client.global_max, 2,
+                         "different sessions were serialized — lock is too coarse")
+
+    def test_mixed_load_serializes_per_session_only(self):
+        """A mixed burst: many calls across two sessions. Each session is
+        internally serialized (max 1 each) while the two sessions overlap
+        globally (peak 2). This is the exact property the fix guarantees."""
+        client = SerializationClient(hold=0.03)
+        targets = []
+        for _ in range(4):
+            targets.append(lambda: client.click("sA", 0, 0))
+            targets.append(lambda: client.screenshot_action_probe("sB"))
+        _run_concurrently(targets)
+        self.assertEqual(client.max_active.get("sA"), 1)
+        self.assertEqual(client.max_active.get("sB"), 1)
+        self.assertEqual(client.global_max, 2)
+
+    def test_reentrant_same_session_does_not_deadlock(self):
+        """The per-session lock is reentrant (RLock): the screenshot nochange/
+        diff recovery path re-enters _request for the SAME session on the SAME
+        thread. A non-reentrant lock would self-deadlock; this proves it does
+        not (the nested same-session call returns)."""
+        client = SerializationClient(hold=0.0)
+        done = {}
+
+        # Simulate re-entry: from inside one same-session request, issue another
+        # same-session request on the same thread (exactly what the recursive
+        # screenshot() recovery does). With an RLock this returns; a plain Lock
+        # would hang here forever.
+        outer_do = client._do_request
+
+        def reentrant_do(method, path, **kwargs):
+            sid = client._session_id_from_path(path)
+            if sid == "s1" and "nested" not in done:
+                done["nested"] = True
+                # Nested same-session call goes back through the locking _request.
+                client._request("POST", "/sessions/s1/move", json={"x": 0, "y": 0})
+            return outer_do(method, path, **kwargs)
+
+        client._do_request = reentrant_do  # type: ignore[method-assign]
+
+        finished = threading.Event()
+
+        def go():
+            client.click("s1", 5, 5)
+            finished.set()
+
+        t = threading.Thread(target=go)
+        t.start()
+        t.join(timeout=5)
+        self.assertTrue(finished.is_set(),
+                        "reentrant same-session request deadlocked (lock not RLock)")
+        self.assertTrue(done.get("nested"))
+
+
+# Small convenience used by test_mixed_load_serializes_per_session_only so both
+# branches of the mixed burst go through the locking _request path with a known
+# session id. (A thin alias over the action POST.)
+def _screenshot_action_probe(self, session_id):
+    return self._request("POST", f"/sessions/{session_id}/click", json={"x": 0, "y": 0})
+
+
+SerializationClient.screenshot_action_probe = _screenshot_action_probe  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

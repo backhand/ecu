@@ -29,9 +29,11 @@ Environment:
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,10 +106,70 @@ class ECUClient:
             raise ECUError("ECU_API_KEY is not set (provisioned API key).")
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+        # Per-session request serialization (protocol #4). The single-tenant tool
+        # server processes one input action at a time; firing two requests at the
+        # SAME session concurrently is never useful and only invites surprises
+        # (an action queued behind a slow screenshot). We therefore hold a
+        # per-session lock for the duration of each request so all calls to one
+        # session are serialized, while DIFFERENT sessions still run fully in
+        # parallel (each has its own lock). `_locks_guard` is a tiny global lock
+        # held only to get-or-create a session's lock — never during the HTTP
+        # call itself. The per-session lock is an RLock so the screenshot diff/
+        # nochange recovery path (which re-enters screenshot() -> _request on the
+        # same thread/session) doesn't self-deadlock.
+        self._locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.RLock] = {}
+
+    # ---- per-session serialization ---------------------------------------
+
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        """Get (or lazily create) the lock that serializes one session's calls."""
+        with self._locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._session_locks[session_id] = lock
+            return lock
+
+    @contextlib.contextmanager
+    def _serialize(self, session_id: Optional[str]):
+        """Hold the given session's lock for the wrapped block.
+
+        ``session_id is None`` (e.g. the session-less ``POST /sessions`` create)
+        means "nothing to serialize against" — we yield without locking so
+        session creation never blocks behind another session's traffic.
+        """
+        if not session_id:
+            yield
+            return
+        with self._session_lock(session_id):
+            yield
+
+    @staticmethod
+    def _session_id_from_path(path: str) -> Optional[str]:
+        """Extract the session id from a control-plane path, or None.
+
+        Paths are ``/sessions`` (create — no id) or ``/sessions/{id}[/...]``. We
+        key the per-session lock on ``{id}`` so every action/screenshot/status
+        call for one session serializes, while the id-less create does not.
+        """
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "sessions":
+            return parts[1]
+        return None
 
     # ---- low-level HTTP ---------------------------------------------------
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
+        # Serialize per session: the lock is keyed off the {id} in the path so
+        # two concurrent calls to the same session can't overlap on the wire,
+        # while different sessions proceed in parallel. Held across the whole
+        # request/response (this is what prevents a click racing a screenshot
+        # in-process); released as soon as we return.
+        with self._serialize(self._session_id_from_path(path)):
+            return self._do_request(method, path, **kwargs)
+
+    def _do_request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.base_url}{path}"
         try:
             resp = self._session.request(
