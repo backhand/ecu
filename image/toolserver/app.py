@@ -7,9 +7,12 @@ GUI action is forwarded to the demo's ``ComputerTool`` (xdotool/scrot under
 the hood). Only ``/exec`` and the ``/screenshot`` framing add local logic.
 
 Component 1 of ECU. The screenshot diff protocol (``nochange``/``diff``) is
-Component 6; here we always return ``mode:"full"`` but keep the last frame
-bytes and a monotonic ``frame_token`` so diffing can slot in without changing
-the wire contract.
+Component 6: ``/screenshot`` keeps the last frame (PNG bytes + decoded pixels)
+and a monotonic ``frame_token``, and against the caller's ``since`` token it
+returns ``nochange`` (pixel-identical), ``diff`` (only changed tile regions),
+or ``full`` (first frame / forced / since mismatch / diff-bigger-than-full).
+The client composites diff regions onto its cached base to reconstruct the
+full frame; the model never sees a diff (see skill/ecu_client.py).
 
 Security note: this binds to 0.0.0.0 *inside the container* on purpose. The
 "localhost-only" property is enforced by how the instance publishes the port
@@ -20,14 +23,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
-import struct
 import subprocess
 import threading
 from typing import Literal
 
+import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 # Import the *latest* concrete ComputerTool directly from the module. Note the
@@ -58,6 +63,23 @@ DISPLAY = f":{DISPLAY_NUM}"
 NOVNC_PORT = int(os.getenv("ECU_NOVNC_PORT") or 6080)
 WATCH_PATH = os.getenv("ECU_WATCH_PATH", "/vnc.html")
 
+# Diff protocol (Component 6). The dirty-check is a coarse grid: we compare the
+# current frame against the base in TILE_SIZE x TILE_SIZE blocks (cheap, no
+# per-pixel bbox work), then merge horizontally-adjacent changed tiles in each
+# tile-row into rectangles. 64px keeps the tile count low and the merged
+# rectangles tight without dragging large unchanged areas into a crop.
+TILE_SIZE = int(os.getenv("ECU_DIFF_TILE") or 64)
+
+# Full-fallback when the change is too big to be worth diffing. Two triggers:
+#  * byte rule: the diff region PNGs together weigh >= the full-frame PNG (the
+#    brief's primary rule -- never ship a diff bigger than a full frame);
+#  * coverage rule: the changed tiles cover >= FULL_COVERAGE of the frame. With
+#    a horizontal row-merge a whole-screen change reconstructs the same pixels
+#    as ~one full frame at near-identical size, so the byte rule sits right on
+#    the boundary; the coverage rule makes the brief's stated "a whole-screen
+#    change / page transition falls back to full" deterministic. Either trips it.
+FULL_COVERAGE = float(os.getenv("ECU_DIFF_FULL_COVERAGE") or 0.9)
+
 app = FastAPI(title="ECU tool server", version="1")
 
 
@@ -78,28 +100,38 @@ _computer._scaling_enabled = False
 
 
 class _FrameState:
-    """Holds the most recent captured frame and a monotonic token.
+    """The instance's single base frame: PNG bytes, decoded pixels, and token.
 
-    Kept here (rather than thrown away) so the Component 6 diff protocol can
-    compare against the last frame and emit ``nochange``/``diff`` without any
-    change to this server's external shape.
+    Single-tenant per instance, so this is the one frame the brief refers to
+    ("per session = the one frame"). The diff protocol compares a freshly
+    captured frame against ``pixels`` (an HxWx3 uint8 numpy array) to emit
+    ``nochange``/``diff``, and advances ``token`` only when the base actually
+    moves (full/diff), never on ``nochange``. All access is lock-guarded.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._token = 0
-        self._last_png: bytes | None = None
+        self._png: bytes | None = None
+        self._pixels: np.ndarray | None = None
 
-    def next(self, png: bytes) -> int:
+    def snapshot(self) -> tuple[int, bytes | None, np.ndarray | None]:
+        """Atomically read the current base (token, png, pixels)."""
+        with self._lock:
+            return self._token, self._png, self._pixels
+
+    def set(self, png: bytes, pixels: np.ndarray) -> int:
+        """Replace the base with a new frame, advance the token, return it."""
         with self._lock:
             self._token += 1
-            self._last_png = png
+            self._png = png
+            self._pixels = pixels
             return self._token
 
     @property
     def last_png(self) -> bytes | None:
         with self._lock:
-            return self._last_png
+            return self._png
 
     @property
     def token(self) -> int:
@@ -113,15 +145,6 @@ _frames = _FrameState()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _png_dimensions(png: bytes) -> tuple[int, int] | None:
-    """Return (width, height) parsed from a PNG header, or None."""
-    # PNG signature (8 bytes) + IHDR length+type (8 bytes) then W,H as uint32be.
-    if len(png) >= 24 and png[:8] == b"\x89PNG\r\n\x1a\n":
-        width, height = struct.unpack(">II", png[16:24])
-        return width, height
-    return None
 
 
 class ToolActionError(Exception):
@@ -152,6 +175,83 @@ async def _capture_png() -> bytes:
     if not b64:
         raise ToolActionError(getattr(result, "error", None) or "screenshot failed")
     return base64.b64decode(b64)
+
+
+# --- diff protocol helpers (Component 6) -----------------------------------
+
+
+def _decode_rgb(png: bytes) -> np.ndarray:
+    """Decode a PNG to a contiguous HxWx3 uint8 RGB array.
+
+    RGB (not RGBA) so the per-tile comparison and the region crops match what
+    the client reconstructs with (``Image.open(...).convert("RGB")``).
+    """
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    return np.asarray(im, dtype=np.uint8)
+
+
+def _encode_crop_png(pixels: np.ndarray, x: int, y: int, w: int, h: int) -> bytes:
+    """Crop (x,y,w,h) out of an RGB pixel array and encode it as a PNG."""
+    crop = pixels[y : y + h, x : x + w]
+    buf = io.BytesIO()
+    Image.fromarray(crop, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _changed_tile_grid(base: np.ndarray, cur: np.ndarray, tile: int) -> np.ndarray:
+    """Return a boolean grid (tiles_y x tiles_x) marking changed tiles.
+
+    Compares the two frames block-by-block on a ``tile``-px grid. Edge tiles on
+    the right/bottom may be smaller than ``tile`` when W/H aren't multiples of
+    it; we slice to the frame bounds so every pixel falls in exactly one tile.
+    """
+    h, w = cur.shape[:2]
+    tiles_y = (h + tile - 1) // tile
+    tiles_x = (w + tile - 1) // tile
+    grid = np.zeros((tiles_y, tiles_x), dtype=bool)
+    # Per-pixel inequality once, then reduce per tile block. `diff` is HxW bool
+    # (any channel differing); cheap relative to PNG decode/encode.
+    diff = np.any(base != cur, axis=2)
+    for ty in range(tiles_y):
+        y0 = ty * tile
+        y1 = min(y0 + tile, h)
+        row = diff[y0:y1]
+        for tx in range(tiles_x):
+            x0 = tx * tile
+            x1 = min(x0 + tile, w)
+            if row[:, x0:x1].any():
+                grid[ty, tx] = True
+    return grid
+
+
+def _merge_tiles_to_rects(
+    grid: np.ndarray, tile: int, w: int, h: int
+) -> list[tuple[int, int, int, int]]:
+    """Merge changed tiles into (x,y,w,h) rectangles, clamped to the frame.
+
+    Simple per-tile-row horizontal run-merge (per the brief): each maximal run
+    of changed tiles in a row becomes one rectangle. Adjacent rows are NOT
+    merged vertically -- kept deliberately simple; it still covers every
+    changed pixel, which is what reconstruction correctness requires.
+    """
+    rects: list[tuple[int, int, int, int]] = []
+    tiles_y, tiles_x = grid.shape
+    for ty in range(tiles_y):
+        tx = 0
+        while tx < tiles_x:
+            if not grid[ty, tx]:
+                tx += 1
+                continue
+            run_start = tx
+            while tx < tiles_x and grid[ty, tx]:
+                tx += 1
+            run_end = tx  # exclusive
+            x = run_start * tile
+            y = ty * tile
+            rw = min(run_end * tile, w) - x
+            rh = min((ty + 1) * tile, h) - y
+            rects.append((x, y, rw, rh))
+    return rects
 
 
 def _display_ready() -> bool:
@@ -244,34 +344,105 @@ async def healthz() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+def _full_response(png: bytes, pixels: np.ndarray) -> dict:
+    """Set ``png``/``pixels`` as the new base and build a ``full`` payload."""
+    token = _frames.set(png, pixels)
+    h, w = pixels.shape[:2]
+    return {
+        "mode": "full",
+        "frame_token": token,
+        "image": base64.b64encode(png).decode(),
+        "width": w,
+        "height": h,
+    }
+
+
+def _diff_or_full(
+    png: bytes,
+    pixels: np.ndarray,
+    base_token: int,
+    base_pixels: np.ndarray,
+) -> dict:
+    """Compute the diff response shape against the held base (sync/CPU-bound).
+
+    Returns ``nochange`` (no tile changed -- base/token untouched), ``diff``
+    (changed tiles merged into region PNGs), or ``full`` (the diff would be
+    >= a full frame, so sending it would be a pessimization). Runs off the
+    event loop via ``asyncio.to_thread``.
+    """
+    h, w = pixels.shape[:2]
+
+    # Shape mismatch (resolution change) -> can't tile-diff; send a full frame.
+    if base_pixels.shape != pixels.shape:
+        return _full_response(png, pixels)
+
+    grid = _changed_tile_grid(base_pixels, pixels, TILE_SIZE)
+    changed = int(grid.sum())
+    if changed == 0:
+        # Pixel-identical: keep the same token, don't move the base.
+        return {"mode": "nochange", "frame_token": base_token}
+
+    # Coverage full-fallback: a (near-)whole-screen change can't be cheaper as a
+    # diff than as one full frame, so don't bother cropping/encoding it.
+    if changed >= FULL_COVERAGE * grid.size:
+        return _full_response(png, pixels)
+
+    rects = _merge_tiles_to_rects(grid, TILE_SIZE, w, h)
+    regions = []
+    region_bytes = 0
+    for (x, y, rw, rh) in rects:
+        rpng = _encode_crop_png(pixels, x, y, rw, rh)
+        region_bytes += len(rpng)
+        regions.append(
+            {"x": x, "y": y, "w": rw, "h": rh, "image": base64.b64encode(rpng).decode()}
+        )
+
+    # Byte full-fallback: never ship a diff that's >= the full frame on the wire.
+    if region_bytes >= len(png):
+        return _full_response(png, pixels)
+
+    new_token = _frames.set(png, pixels)
+    return {
+        "mode": "diff",
+        "frame_token": new_token,
+        "base_token": base_token,
+        "width": w,
+        "height": h,
+        "regions": regions,
+    }
+
+
 @app.post("/screenshot")
 async def screenshot(body: ScreenshotBody) -> JSONResponse:
-    """Capture a frame.
+    """Capture a frame and return it as ``full``, ``diff``, or ``nochange``.
 
-    Component 1 always returns a full frame. The handler keeps the last frame
-    bytes and a monotonic frame_token so the Component 6 diff protocol
-    (nochange/diff against ``since``) can be added here without changing the
-    response shape callers already depend on.
+    Decision tree (single base frame per instance, see ``_FrameState``):
+      * ``mode=="full"``, no base yet, or ``since`` != the current base token
+        -> return ``full`` and set the new base.
+      * else compare current vs base per 64px tile:
+          - no tile changed            -> ``nochange`` (token unchanged)
+          - tiles changed              -> ``diff`` of merged region PNGs
+          - >=90% of tiles changed, or
+            diff bytes >= full bytes   -> ``full`` (don't ship an oversized diff)
+    The client composites diff regions onto its cached base to reconstruct the
+    complete frame before showing it to a model (it never sees a diff).
     """
     try:
         png = await _capture_png()
     except ToolActionError as exc:
         return _err(str(exc))
 
-    token = _frames.next(png)
+    pixels = _decode_rgb(png)
+    base_token, _base_png, base_pixels = _frames.snapshot()
 
-    dims = _png_dimensions(png)
-    width, height = dims if dims else (WIDTH, HEIGHT)
+    # Forced full / first frame / caller's base doesn't match ours -> full.
+    if body.mode == "full" or base_pixels is None or body.since != base_token:
+        return JSONResponse(_full_response(png, pixels))
 
-    return JSONResponse(
-        {
-            "mode": "full",
-            "frame_token": token,
-            "image": base64.b64encode(png).decode(),
-            "width": width,
-            "height": height,
-        }
+    payload = await asyncio.to_thread(
+        _diff_or_full, png, pixels, base_token, base_pixels
     )
+    return JSONResponse(payload)
 
 
 @app.post("/click")

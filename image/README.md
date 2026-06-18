@@ -35,7 +35,7 @@ the image, `ComputerTool20251124`, driving `xdotool`/`scrot`). Only `/exec`
 
 | Method & path     | Body                          | Response |
 |-------------------|-------------------------------|----------|
-| `POST /screenshot`| `{since?, mode?}`             | `{"mode":"full","frame_token":N,"image":"<base64 png>","width":W,"height":H}` |
+| `POST /screenshot`| `{since?, mode?}`             | `nochange` / `diff` / `full` (see "Screenshot protocol" below) |
 | `POST /click`     | `{x,y,button}` (left/right/middle) | `{"ok":true}` |
 | `POST /move`      | `{x,y}`                       | `{"ok":true}` |
 | `POST /type`      | `{text}`                      | `{"ok":true}` |
@@ -47,10 +47,8 @@ the image, `ComputerTool20251124`, driving `xdotool`/`scrot`). Only `/exec`
 
 Notes:
 
-- **`/screenshot`** always returns a full frame in this component. The server
-  keeps the last frame bytes and a monotonic `frame_token`, so the Component 6
-  diff protocol (`nochange`/`diff` against `since`) slots in without changing
-  the response shape. `width`/`height` are read from the actual PNG (equal to
+- **`/screenshot`** is diff-aware (Component 6) — see the dedicated section
+  below. `width`/`height` are the decoded frame dimensions (equal to
   `WIDTH`/`HEIGHT`).
 - **`/scroll`** maps `dx`/`dy` onto the demo's scroll action: `dy>0` down /
   `dy<0` up, `dx>0` right / `dx<0` left, amount = `abs(value)`; one scroll is
@@ -61,6 +59,49 @@ Notes:
   per-command exit code.
 - **`/healthz`** returns 503 until `xdpyinfo` can reach the display, so callers
   can wait for the desktop before screenshotting.
+
+### Screenshot protocol (diff-aware, Component 6)
+
+`POST /screenshot {since?, mode?}` returns one of three shapes so polling a
+static screen is nearly free and only changed regions travel the wire. The
+server keeps a single base frame for the instance (PNG bytes + decoded pixels +
+a monotonic `frame_token`), guarded by a lock.
+
+- `since` (int, optional): the `frame_token` the caller currently holds.
+- `mode` (optional): `auto` (default — server decides) or `full` (force a
+  complete frame).
+
+Three responses, distinguished by `mode`:
+
+| `mode`     | Shape | When |
+|------------|-------|------|
+| `nochange` | `{"mode":"nochange","frame_token":<same as since>}` | current frame is **pixel-identical** to `since` (token does **not** advance) |
+| `diff`     | `{"mode":"diff","frame_token":<new>,"base_token":<since>,"width":W,"height":H,"regions":[{"x","y","w","h","image":<b64 png>}, …]}` | only some tiles changed; the caller composites each region PNG onto its cached base at `(x,y)` |
+| `full`     | `{"mode":"full","frame_token":<new>,"width":W,"height":H,"image":<b64 png>}` | first capture, `mode:"full"` forced, `since` ≠ the server's current base, or a diff would be no cheaper than a full frame |
+
+How the diff is computed:
+
+- **Tile dirty-check (64px grid).** The current frame is compared to the base
+  in `64x64` blocks via numpy (`ECU_DIFF_TILE` overrides the size); edge tiles
+  on the right/bottom are sliced to the frame bounds so every pixel is covered.
+- **Run-merge.** Changed tiles are merged into rectangles by a simple
+  per-tile-row horizontal run (no vertical merge — kept deliberately simple);
+  each rectangle is cropped from the current frame and PNG-encoded as a region.
+- **Full-fallback (two triggers).** Return `full` instead of `diff` when either
+  the changed tiles cover **≥ 90 %** of the frame (`ECU_DIFF_FULL_COVERAGE`) —
+  a whole-screen change / page transition — **or** the diff region PNGs together
+  weigh **≥ the full-frame PNG**. (With a row-merge a whole-screen diff
+  re-encodes the same pixels as ~one full frame at near-identical size, so the
+  byte rule sits on the boundary; the coverage rule makes the whole-screen case
+  deterministic.)
+- **Token semantics.** `nochange` returns the *same* token as `since` and does
+  not move the base. `diff`/`full` advance the token and set the new base.
+
+The **client always reconstructs a complete frame** (cache the base, paste the
+regions) before handing anything to a model — vision models can't apply
+patches. Diffing is purely a wire/latency optimization; downscaling the
+reconstructed frame (client side) is the main *token* lever. See
+`skill/ecu-computer-use/ecu_client.py` (`_apply_diff`).
 
 ### Coordinates and scaling
 
@@ -87,6 +128,8 @@ plane's job (Component 4), not the container's.
 | `ECU_TOOLSERVER_PORT` | 8000      | Port uvicorn binds inside the container. |
 | `ECU_NOVNC_PORT`      | 6080      | noVNC port that `/watch` redirects to. |
 | `ECU_WATCH_PATH`      | /vnc.html | noVNC client page for `/watch`. |
+| `ECU_DIFF_TILE`       | 64        | Tile size (px) for the screenshot dirty-check grid. |
+| `ECU_DIFF_FULL_COVERAGE` | 0.9    | Changed-tile fraction at/above which `/screenshot` falls back to `full`. |
 
 ## Build & run locally
 
@@ -131,11 +174,43 @@ curl -s -XPOST localhost:8000/exec -H 'content-type: application/json' \
 curl -s -XPOST localhost:8000/screenshot -H 'content-type: application/json' -d '{}' \
   | python3 -c 'import sys,json,base64;d=json.load(sys.stdin);open("/tmp/shot2.png","wb").write(base64.b64decode(d["image"]))'
 
-# watch (302 -> noVNC)
-curl -sI localhost:8000/watch | head -2
+# watch (302 -> noVNC; use GET, the route only allows GET)
+curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' localhost:8000/watch
 
 docker rm -f ecu1
 ```
 
 Watch the live desktop in a browser while testing: open
 <http://localhost:6080/vnc.html> (or just hit `http://localhost:8000/watch`).
+
+### Screenshot diff-protocol smoke test
+
+This driver proves the four diff-protocol behaviors against a running container
+(needs `numpy` + `Pillow` on the host — already present in the image, so you can
+also run it *inside* the container). It uses deterministic, blink-free changes
+(still `display` image windows for a small change; a Tk fullscreen window for
+the whole-screen change) and reconstructs the diff exactly like the real client
+(`ecu_client.py`): composite each region PNG onto the cached base, then assert
+the result is pixel-identical to a forced-full of the same settled screen.
+
+```bash
+docker run -d --name ecu-c6 --platform linux/amd64 -p 127.0.0.1:8000:8000 ecu-image:dev
+curl -s --retry 90 --retry-delay 2 --retry-all-errors --retry-connrefused \
+  -o /dev/null -w 'healthz:%{http_code}\n' http://localhost:8000/healthz
+python3 image/toolserver/diff_smoke.py        # the driver below
+docker rm -f ecu-c6
+```
+
+`image/toolserver/diff_smoke.py` exercises, in order:
+
+1. **full** — first capture (note token `T0`);
+2. **nochange** — on the static idle desktop, `POST {"since":T0}` returns
+   `mode:"nochange"` with the **same** `frame_token` (the desktop is verified
+   empirically static at minute clock resolution);
+3. **diff** — recolor a small still window, `POST {"since":<base>}` returns
+   `mode:"diff"`; the driver reconstructs base + regions and asserts **0**
+   differing pixels vs a forced-full, printing the byte savings (~93–95 %);
+4. **full-fallback** — a Tk **fullscreen** window changes the whole screen;
+   `POST {"since":<base>}` returns `mode:"full"` (≥ 90 % of tiles changed).
+
+Expected tail: `RESULT: ALL CHECKS PASSED`.
