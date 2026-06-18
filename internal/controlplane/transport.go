@@ -88,6 +88,63 @@ func (rt *endpointRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 	return rt.next.RoundTrip(out)
 }
 
+// tunnelTransport is the Component 3 SessionTransport. It resolves a session id
+// to the http.RoundTripper of that session's live reverse tunnel (a yamux mux
+// over the WebSocket the instance dialed out). The tool-server address never
+// exists on this side at all — the RoundTripper writes onto a yamux stream that
+// the agent splices to the local tool server — so it is structurally impossible
+// for an address to leak into a client-facing response through this path.
+//
+// ok is false when no live tunnel is registered for the session (no agent
+// connected, or the tunnel died). The composite transport then falls back to
+// the direct dev path, and if that also fails the handler responds 404/409.
+type tunnelTransport struct {
+	registry *tunnelRegistry
+}
+
+// newTunnelTransport builds a tunnelTransport backed by the given registry.
+func newTunnelTransport(registry *tunnelRegistry) *tunnelTransport {
+	return &tunnelTransport{registry: registry}
+}
+
+// RoundTripper returns the live tunnel's RoundTripper for sessionID, or
+// ok=false if no tunnel is currently registered.
+func (t *tunnelTransport) RoundTripper(sessionID string) (http.RoundTripper, bool) {
+	tun, ok := t.registry.lookup(sessionID)
+	if !ok {
+		return nil, false
+	}
+	return tun.RoundTripper(), true
+}
+
+// compositeTransport prefers a live reverse tunnel and falls back to the direct
+// dev endpoint. This lets the production tunnel flow and the ECU_DEV_TOOLSERVER
+// seam coexist: when an agent is connected, actions ride the tunnel; when only
+// the dev seam is configured (no tunnel), they ride the direct path; when
+// neither resolves, both return ok=false and the handler responds 404.
+//
+// It implements SessionTransport, so the proxy handler is unchanged — the
+// preference logic lives entirely behind the seam.
+type compositeTransport struct {
+	tunnel SessionTransport // preferred
+	direct SessionTransport // fallback (dev seam; may always return ok=false)
+}
+
+// newCompositeTransport wires the tunnel transport (preferred) ahead of the
+// direct transport (fallback).
+func newCompositeTransport(tun, direct SessionTransport) *compositeTransport {
+	return &compositeTransport{tunnel: tun, direct: direct}
+}
+
+// RoundTripper returns the tunnel's RoundTripper when a live tunnel exists,
+// otherwise the direct transport's. ok is false only when neither resolves.
+func (c *compositeTransport) RoundTripper(sessionID string) (http.RoundTripper, bool) {
+	if rt, ok := c.tunnel.RoundTripper(sessionID); ok {
+		return rt, true
+	}
+	return c.direct.RoundTripper(sessionID)
+}
+
 // singleJoin joins a base path and a request path with exactly one separating
 // slash, tolerating empty/“/” bases.
 func singleJoin(basePath, reqPath string) string {

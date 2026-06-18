@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     width            INTEGER NOT NULL,
     height           INTEGER NOT NULL,
     created_at       TEXT NOT NULL,             -- RFC3339Nano
-    last_activity_at TEXT NOT NULL              -- RFC3339Nano
+    last_activity_at TEXT NOT NULL,             -- RFC3339Nano
+    tunnel_token     TEXT NOT NULL DEFAULT ''   -- opaque per-session token an agent presents at /agent/connect (C3)
 );
 `
 
@@ -86,7 +87,52 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: applying schema: %w", err)
 	}
+	// Idempotent migration for the C3 tunnel_token column. CREATE TABLE IF NOT
+	// EXISTS never alters an existing table, so a sessions table created by an
+	// earlier build lacks tunnel_token. This is pre-release, so rather than a
+	// full migration framework we detect the missing column via PRAGMA
+	// table_info and ADD it once. The ALTER is a no-op skip when the column is
+	// already present (fresh DBs from the schema above).
+	if err := ensureSessionTunnelToken(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// ensureSessionTunnelToken adds the sessions.tunnel_token column if a pre-C3
+// database is missing it. It is safe to run on every Open: it queries
+// PRAGMA table_info(sessions) and only issues the ALTER when the column is
+// absent. modernc.org/sqlite supports both PRAGMA table_info and ALTER TABLE
+// ADD COLUMN.
+func ensureSessionTunnelToken(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sessions);`)
+	if err != nil {
+		return fmt.Errorf("store: inspecting sessions columns: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		// PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk.
+		var (
+			cid         int
+			name, ctype string
+			notnull, pk int
+			dfltValue   sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("store: scanning sessions column info: %w", err)
+		}
+		if name == "tunnel_token" {
+			return rows.Err() // already present, nothing to migrate
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: iterating sessions columns: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN tunnel_token TEXT NOT NULL DEFAULT '';`); err != nil {
+		return fmt.Errorf("store: adding tunnel_token column: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying database.
@@ -102,4 +148,18 @@ func NewSessionID() (string, error) {
 		return "", fmt.Errorf("store: generating session id: %w", err)
 	}
 	return "s_" + hex.EncodeToString(b), nil
+}
+
+// NewTunnelToken returns an opaque per-session tunnel token: "t_" + 64 hex
+// characters (32 random bytes from crypto/rand). The agent presents this at
+// /agent/connect to bind its outbound tunnel to a specific session; it is
+// compared with crypto/subtle.ConstantTimeCompare on the server side. The wider
+// 32-byte body (vs the 16-byte session id) reflects its role as an
+// authentication secret rather than a mere identifier.
+func NewTunnelToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("store: generating tunnel token: %w", err)
+	}
+	return "t_" + hex.EncodeToString(b), nil
 }

@@ -2,7 +2,11 @@ module github.com/backhand/ecu
 
 go 1.26
 
-require modernc.org/sqlite v1.52.0
+require (
+	github.com/coder/websocket v1.8.15
+	github.com/hashicorp/yamux v0.1.2
+	modernc.org/sqlite v1.52.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

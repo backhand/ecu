@@ -44,7 +44,9 @@ func TestCreateSessionDevMode(t *testing.T) {
 }
 
 // TestCreateSessionNoDevMode verifies that without the dev seam, a session is
-// created in the error state and still readable via GET.
+// created in the provisioning state (awaiting its reverse tunnel, per C3) and
+// still readable via GET. It also confirms the tunnel token is NOT leaked in
+// the response by default (only the dev exposure seam surfaces it).
 func TestCreateSessionNoDevMode(t *testing.T) {
 	st := newTestStore(t)
 	srv := NewServer(st, "")
@@ -59,8 +61,15 @@ func TestCreateSessionNoDevMode(t *testing.T) {
 	}
 	var resp createSessionResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Status != statusError {
-		t.Fatalf("status = %q, want error when no provisioning backend", resp.Status)
+	if resp.Status != statusProvisioning {
+		t.Fatalf("status = %q, want provisioning when awaiting a tunnel", resp.Status)
+	}
+	// Without the dev exposure seam, the token/url must be omitted entirely.
+	if resp.TunnelToken != "" || resp.TunnelURL != "" {
+		t.Fatalf("tunnel token/url leaked without exposure seam: token=%q url=%q", resp.TunnelToken, resp.TunnelURL)
+	}
+	if strings.Contains(rec.Body.String(), "tunnel_token") {
+		t.Fatalf("response unexpectedly contains tunnel_token: %s", rec.Body.String())
 	}
 
 	// GET it back.
@@ -70,8 +79,8 @@ func TestCreateSessionNoDevMode(t *testing.T) {
 	}
 	var get getSessionResponse
 	_ = json.Unmarshal(rec2.Body.Bytes(), &get)
-	if get.Status != statusError {
-		t.Fatalf("GET status field = %q, want error", get.Status)
+	if get.Status != statusProvisioning {
+		t.Fatalf("GET status field = %q, want provisioning", get.Status)
 	}
 	if get.WatchURL != nil {
 		t.Fatalf("watch_url = %v, want null", *get.WatchURL)

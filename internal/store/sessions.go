@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -18,6 +19,12 @@ type Session struct {
 	Height         int
 	CreatedAt      time.Time
 	LastActivityAt time.Time
+	// TunnelToken is the opaque secret an agent presents at /agent/connect to
+	// bind its reverse tunnel to this session (C3). Empty for dev-mode sessions
+	// (which reach the tool server directly) and for sessions created before
+	// the tunnel_token migration. Never exposed to clients except via the
+	// dev-only ECU_DEV_EXPOSE_TUNNEL_TOKEN seam.
+	TunnelToken string
 }
 
 // CreateSession inserts a new session row. created_at and last_activity_at are
@@ -30,12 +37,12 @@ func (s *Store) CreateSession(sess *Session) error {
 	sess.LastActivityAt = now
 	const q = `
 INSERT INTO sessions
-    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
+    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	_, err := s.db.Exec(q,
 		sess.ID, sess.Account, sess.Status, sess.ToolEndpoint, boolToInt(sess.Persistent),
 		sess.Width, sess.Height,
-		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken,
 	)
 	if err != nil {
 		return fmt.Errorf("store: creating session: %w", err)
@@ -48,7 +55,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
 // LookupKey.
 func (s *Store) GetSession(id string) (sess *Session, found bool, err error) {
 	const q = `
-SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at
+SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token
 FROM sessions WHERE id = ?;`
 	var (
 		out                      Session
@@ -58,7 +65,7 @@ FROM sessions WHERE id = ?;`
 	row := s.db.QueryRow(q, id)
 	switch err := row.Scan(
 		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
-		&out.Width, &out.Height, &createdAtStr, &lastActStr,
+		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken,
 	); {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil
@@ -93,6 +100,58 @@ func (s *Store) TouchSession(id string) error {
 		return fmt.Errorf("store: touching session: %w", err)
 	}
 	return nil
+}
+
+// SessionByTunnelToken resolves a presented tunnel token to its session. It is
+// the authentication primitive behind /agent/connect.
+//
+// Security properties:
+//   - An empty presented token NEVER authenticates (rejected before any query),
+//     so the tunnel_token=” default on dev-mode / pre-migration rows can never
+//     be matched by an empty or absent Authorization header.
+//   - The final equality decision uses crypto/subtle.ConstantTimeCompare on the
+//     stored vs presented bytes, even though the lookup is by token, as
+//     defense-in-depth against timing oracles. A length/!=1 result yields
+//     found=false.
+//
+// found is false (with err=nil) when no row matches; that is not an error,
+// matching the LookupKey convention.
+func (s *Store) SessionByTunnelToken(token string) (sess *Session, found bool, err error) {
+	if token == "" {
+		return nil, false, nil
+	}
+	const q = `
+SELECT id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token
+FROM sessions WHERE tunnel_token = ? LIMIT 1;`
+	var (
+		out                      Session
+		persistentInt            int
+		createdAtStr, lastActStr string
+	)
+	row := s.db.QueryRow(q, token)
+	switch err := row.Scan(
+		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
+		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken,
+	); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("store: getting session by tunnel token: %w", err)
+	}
+	// Defense-in-depth constant-time compare; also guards the (impossible here)
+	// case where the stored token is empty.
+	if out.TunnelToken == "" ||
+		subtle.ConstantTimeCompare([]byte(out.TunnelToken), []byte(token)) != 1 {
+		return nil, false, nil
+	}
+	out.Persistent = persistentInt != 0
+	if out.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAtStr); err != nil {
+		return nil, false, fmt.Errorf("store: parsing created_at: %w", err)
+	}
+	if out.LastActivityAt, err = time.Parse(time.RFC3339Nano, lastActStr); err != nil {
+		return nil, false, fmt.Errorf("store: parsing last_activity_at: %w", err)
+	}
+	return &out, true, nil
 }
 
 // boolToInt maps a Go bool to the 0/1 INTEGER convention used in the schema.

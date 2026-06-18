@@ -25,12 +25,21 @@ type createSessionRequest struct {
 }
 
 // createSessionResponse is the POST /sessions response.
+//
+// TunnelToken and TunnelURL are a DEV-ONLY testability seam: they are populated
+// (and serialized) ONLY when the server was built WithExposeTunnelToken(true)
+// (ECU_DEV_EXPOSE_TUNNEL_TOKEN=1) AND a token was actually generated (the
+// non-dev provisioning path). In every other case they are empty and omitempty
+// keeps them out of the JSON entirely, so production clients never see the
+// tunnel secret.
 type createSessionResponse struct {
-	SessionID  string `json:"session_id"`
-	Status     string `json:"status"`
-	Persistent bool   `json:"persistent"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
+	SessionID   string `json:"session_id"`
+	Status      string `json:"status"`
+	Persistent  bool   `json:"persistent"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	TunnelToken string `json:"tunnel_token,omitempty"`
+	TunnelURL   string `json:"tunnel_url,omitempty"`
 }
 
 // getSessionResponse is the GET /sessions/{id} response. WatchURL is always
@@ -47,14 +56,23 @@ type getSessionResponse struct {
 // handleCreateSession creates a new session record for the authenticated
 // account.
 //
-// In dev mode (ECU_DEV_TOOLSERVER set) the session is pointed at that tool
-// server and marked ready immediately, since there is no provisioning step —
-// this is the path that must work end-to-end. Without the dev seam, the session
-// is created in the error state and returned with HTTP 200 (so a subsequent GET
-// works); real provisioning arrives in C4.
+// Two paths:
+//
+//   - Dev mode (ECU_DEV_TOOLSERVER set): the session is pointed at that tool
+//     server and marked ready immediately, since there is no provisioning step.
+//     No tunnel token is generated (the dev path reaches the tool server
+//     directly, so a token would be unused and is left empty to avoid surprises).
+//   - Otherwise (C3): the session is created as PROVISIONING with a fresh
+//     per-session tunnel token. It becomes ready when an agent dials
+//     /agent/connect and authenticates with that token. (This replaces the C2
+//     skeleton behavior of recording an `error` session.)
 //
 // The persistent flag is accepted and stored but treated as ephemeral here;
 // full persistence handling (authorization, snapshot/restore) is C8.
+//
+// The response includes tunnel_token/tunnel_url ONLY under the dev-only
+// ECU_DEV_EXPOSE_TUNNEL_TOKEN seam (and only on the provisioning path, where a
+// token exists); see createSessionResponse.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	account, _ := accountFromContext(r.Context())
 
@@ -79,13 +97,20 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Height:     defaultHeight,
 	}
 	if s.devToolServer != "" {
-		// Dev seam: skip provisioning, forward to the local tool server.
+		// Dev seam: skip provisioning, forward to the local tool server. No
+		// tunnel token (direct path).
 		sess.Status = statusReady
 		sess.ToolEndpoint = s.devToolServer
 	} else {
-		// No provisioning yet: record an error session so GET still works.
-		sess.Status = statusError
+		// Production path: provision a session awaiting its reverse tunnel.
+		token, err := store.NewTunnelToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not create session")
+			return
+		}
+		sess.Status = statusProvisioning
 		sess.ToolEndpoint = ""
+		sess.TunnelToken = token
 	}
 
 	if err := s.store.CreateSession(sess); err != nil {
@@ -93,13 +118,21 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, createSessionResponse{
+	resp := createSessionResponse{
 		SessionID:  sess.ID,
 		Status:     sess.Status,
 		Persistent: sess.Persistent,
 		Width:      sess.Width,
 		Height:     sess.Height,
-	})
+	}
+	// Dev-only testability seam: surface the tunnel token + ws URL so a test (or
+	// a local agent) can connect. Only when explicitly enabled AND a token was
+	// generated (the provisioning path).
+	if s.exposeTunnelToken && sess.TunnelToken != "" {
+		resp.TunnelToken = sess.TunnelToken
+		resp.TunnelURL = "ws://" + s.listenAddr + agentConnectPath
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleGetSession returns a session's status and dimensions. Unknown ids yield

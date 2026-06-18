@@ -1,10 +1,15 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	// Registers the "sqlite" driver for the raw connection used in the
+	// migration test.
+	_ "modernc.org/sqlite"
 )
 
 // openTestStore opens a Store backed by a real temp file (NOT :memory:, so the
@@ -155,6 +160,112 @@ func TestTouchSessionUpdatesActivity(t *testing.T) {
 		t.Fatalf("last_activity_at not advanced: before=%v after=%v",
 			before.LastActivityAt, after.LastActivityAt)
 	}
+}
+
+// TestSessionByTunnelToken verifies token-based session lookup: a matching
+// token resolves the session, an empty token never matches (even though
+// dev-mode rows store an empty token), and an unknown token returns found=false.
+func TestSessionByTunnelToken(t *testing.T) {
+	st := openTestStore(t)
+
+	tok, err := NewTunnelToken()
+	if err != nil {
+		t.Fatalf("NewTunnelToken: %v", err)
+	}
+	if !strings.HasPrefix(tok, "t_") || len(tok) != len("t_")+64 {
+		t.Fatalf("tunnel token %q not in expected t_+64hex form", tok)
+	}
+
+	id, _ := NewSessionID()
+	if err := st.CreateSession(&Session{
+		ID: id, Account: "admin", Status: "provisioning", ToolEndpoint: "",
+		Width: 1280, Height: 800, TunnelToken: tok,
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Also create a dev-mode-style session with an EMPTY token to prove empty
+	// tokens never authenticate against the default value.
+	idEmpty, _ := NewSessionID()
+	if err := st.CreateSession(&Session{
+		ID: idEmpty, Account: "admin", Status: "ready", ToolEndpoint: "http://x",
+		Width: 1, Height: 1, TunnelToken: "",
+	}); err != nil {
+		t.Fatalf("CreateSession (empty token): %v", err)
+	}
+
+	// Matching token resolves the right session and round-trips the token.
+	got, found, err := st.SessionByTunnelToken(tok)
+	if err != nil || !found {
+		t.Fatalf("SessionByTunnelToken(valid): found=%v err=%v", found, err)
+	}
+	if got.ID != id || got.TunnelToken != tok {
+		t.Fatalf("resolved wrong session: id=%q token=%q", got.ID, got.TunnelToken)
+	}
+
+	// Empty token never matches.
+	if _, found, err := st.SessionByTunnelToken(""); err != nil || found {
+		t.Fatalf("SessionByTunnelToken(\"\"): found=%v err=%v, want found=false", found, err)
+	}
+
+	// Unknown token never matches.
+	if _, found, err := st.SessionByTunnelToken("t_deadbeef"); err != nil || found {
+		t.Fatalf("SessionByTunnelToken(unknown): found=%v err=%v, want found=false", found, err)
+	}
+}
+
+// TestTunnelTokenMigration verifies the idempotent ALTER path: a sessions table
+// created WITHOUT tunnel_token (simulating a pre-C3 DB) is migrated on Open so
+// the column exists and token operations work.
+func TestTunnelTokenMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Hand-create a pre-C3 sessions table (no tunnel_token column) by opening a
+	// raw connection through the same driver and running the old schema.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	const legacySessions = `
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, account TEXT NOT NULL, status TEXT NOT NULL,
+    tool_endpoint TEXT NOT NULL, persistent INTEGER NOT NULL,
+    width INTEGER NOT NULL, height INTEGER NOT NULL,
+    created_at TEXT NOT NULL, last_activity_at TEXT NOT NULL
+);`
+	if _, err := raw.Exec(legacySessions); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	raw.Close()
+
+	// Open via the store: the migration must add tunnel_token.
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrating): %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// A token-bearing session now works end-to-end.
+	tok, _ := NewTunnelToken()
+	id, _ := NewSessionID()
+	if err := st.CreateSession(&Session{
+		ID: id, Account: "admin", Status: "provisioning", ToolEndpoint: "",
+		Width: 1, Height: 1, TunnelToken: tok,
+	}); err != nil {
+		t.Fatalf("CreateSession after migration: %v", err)
+	}
+	got, found, err := st.SessionByTunnelToken(tok)
+	if err != nil || !found || got.ID != id {
+		t.Fatalf("post-migration token lookup failed: found=%v err=%v", found, err)
+	}
+
+	// Opening again must be a no-op (idempotent) and not error.
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open (idempotent migration): %v", err)
+	}
+	st2.Close()
 }
 
 // mustExec runs a statement against the store's db for test setup, failing the

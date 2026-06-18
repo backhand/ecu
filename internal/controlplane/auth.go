@@ -22,13 +22,29 @@ func accountFromContext(ctx context.Context) (string, bool) {
 	return acct, ok
 }
 
+// agentConnectPath is the tunnel-ingress route that authenticates with a
+// per-session tunnel token instead of an API key. authMiddleware exempts it so
+// the API-key check does not reject agents; the handler enforces its own
+// constant-time token check before upgrading the WebSocket.
+const agentConnectPath = "/agent/connect"
+
 // authMiddleware validates the Authorization: Bearer <key> header against the
 // store and, on success, attaches the resolved account to the request context.
 // Every failure mode — missing header, malformed header, empty key, unknown
 // key, and disabled key — is rejected with 401 and a JSON {"detail": ...} body.
-// It wraps the entire mux so all routes are authenticated.
+// It wraps the entire mux so all routes are authenticated EXCEPT the tunnel
+// ingress agentConnectPath, which uses tunnel-token auth handled in its own
+// handler (see broker.go). A single path check is preferred over splitting the
+// mux because it leaves the existing method-based /sessions routing — and every
+// auth test that exercises it — completely unchanged.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == agentConnectPath {
+			// Tunnel ingress: API-key auth does not apply; the handler does its
+			// own per-session token check before upgrading.
+			next.ServeHTTP(w, r)
+			return
+		}
 		key, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
