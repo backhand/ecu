@@ -55,6 +55,11 @@ except Exception:  # pragma: no cover
 DEFAULT_TIMEOUT = 30          # seconds, per HTTP request
 READY_POLL_INTERVAL = 2.0     # seconds between start_session readiness polls
 READY_TIMEOUT = 300           # seconds to wait for a session to become ready
+# Extra wall-clock margin (seconds) added on top of a settle screenshot's
+# server-side ``max_wait_ms`` budget when bumping the per-request HTTP timeout,
+# to cover the capture + round-trip beyond the settle cap. See
+# ``_settle_request_timeout``.
+SETTLE_TIMEOUT_MARGIN = 10.0
 
 
 class ECUError(Exception):
@@ -160,20 +165,34 @@ class ECUClient:
 
     # ---- low-level HTTP ---------------------------------------------------
 
-    def _request(self, method: str, path: str, **kwargs) -> dict:
+    def _request(
+        self, method: str, path: str, timeout: float | None = None, **kwargs
+    ) -> dict:
         # Serialize per session: the lock is keyed off the {id} in the path so
         # two concurrent calls to the same session can't overlap on the wire,
         # while different sessions proceed in parallel. Held across the whole
         # request/response (this is what prevents a click racing a screenshot
         # in-process); released as soon as we return.
+        #
+        # ``timeout`` is an optional PER-REQUEST override of ``self.timeout``,
+        # threaded through to ``_do_request``. It is needed by settle screenshots
+        # (a settle call can block server-side up to ``max_wait_ms`` + round-trip,
+        # which can exceed the default 30 s); ``None`` keeps the default. Passing
+        # it as an explicit kwarg (not inside ``**kwargs``) keeps it out of the
+        # ``requests`` call kwargs except where we put it.
         with self._serialize(self._session_id_from_path(path)):
-            return self._do_request(method, path, **kwargs)
+            return self._do_request(method, path, timeout=timeout, **kwargs)
 
-    def _do_request(self, method: str, path: str, **kwargs) -> dict:
+    def _do_request(
+        self, method: str, path: str, timeout: float | None = None, **kwargs
+    ) -> dict:
         url = f"{self.base_url}{path}"
+        # A per-request override wins; otherwise the client default. This keeps
+        # non-settle calls on the default timeout untouched.
+        eff_timeout = self.timeout if timeout is None else timeout
         try:
             resp = self._session.request(
-                method, url, timeout=self.timeout, **kwargs
+                method, url, timeout=eff_timeout, **kwargs
             )
         except requests.RequestException as e:
             raise ECUError(f"network error calling {method} {path}: {e}") from e
@@ -328,8 +347,14 @@ class ECUClient:
 
         ``screenshot``: an optional trailing-screenshot request dict mirroring
             the ``POST /screenshot`` body (``since``/``mode``/``max_width``/
-            ``format``/``quality``); passed through verbatim in the POST body. It
-            is honored by the server only if every action succeeded.
+            ``format``/``quality``, plus the capture-once-stable settle controls
+            ``settle``/``settle_ms``/``max_wait_ms``); passed through verbatim in
+            the POST body (the caller's dict is NOT mutated). It is honored by
+            the server only if every action succeeded. Putting ``settle_ms`` (or
+            ``settle: true``) here makes the trailing frame a SETTLED capture
+            instead of a possibly mid-render one, capped by ``max_wait_ms``
+            (default ~2500 ms); the per-request HTTP timeout is bumped to match a
+            large cap so the client waits for the server.
 
         Returns ``{"results": [...], "screenshot": <Screenshot or None>}``:
           * ``results`` is the server's per-action results list VERBATIM — each
@@ -369,8 +394,22 @@ class ECUClient:
         if screenshot is not None:
             body["screenshot"] = screenshot
 
+        # If the trailing screenshot asks for settle, the server may block up to
+        # its ``max_wait_ms`` cap before responding; bump the per-request HTTP
+        # timeout to match (else None -> default). The caller's screenshot dict
+        # is read, never mutated.
+        sshot = screenshot or {}
+        req_timeout = _settle_request_timeout(
+            bool(sshot.get("settle")),
+            sshot.get("settle_ms"),
+            sshot.get("max_wait_ms"),
+            self.timeout,
+        )
         data = self._request(
-            "POST", f"/sessions/{sess.session_id}/actions", json=body
+            "POST",
+            f"/sessions/{sess.session_id}/actions",
+            json=body,
+            timeout=req_timeout,
         )
 
         results = data.get("results", [])
@@ -406,6 +445,9 @@ class ECUClient:
         force_full: bool = False,
         format: str = "jpeg",
         quality: int = 75,
+        settle: bool = False,
+        settle_ms: Optional[int] = None,
+        max_wait_ms: Optional[int] = None,
     ) -> "Screenshot":
         """Capture the screen and return a complete, ready-to-show frame.
 
@@ -434,6 +476,22 @@ class ECUClient:
         quality:   lossy quality 1..100 (ignored for png). ~75 is a good
                    legibility/size tradeoff for UI screenshots.
         force_full: ignore the cache and demand a full frame.
+        settle:    capture-once-stable. When True (or when `settle_ms` is set),
+                   the server re-captures until the screen has been visually
+                   unchanged for the settle window, then returns the SETTLED
+                   frame instead of a possibly mid-render one (a just-focused
+                   window before its content paints, a loading page). OFF by
+                   default — the call is then a single immediate capture, exactly
+                   as before, with zero added latency.
+        settle_ms: the settle window in milliseconds (implies settle). The frame
+                   must be unchanged for this long to be considered settled. When
+                   omitted but `settle=True`, the server uses ~300 ms.
+        max_wait_ms: hard cap on the total settle wait (server default ~2500 ms).
+                   An endlessly-animating screen (spinner/video) returns the
+                   latest frame at the cap and never hangs. When a settle cap
+                   larger than the default HTTP timeout is requested, the
+                   per-request timeout is bumped to `max_wait_ms/1000 + margin`
+                   so the client waits long enough for the server to respond.
         """
         body: dict = {
             "mode": "full" if force_full else "auto",
@@ -447,7 +505,26 @@ class ECUClient:
         if sess._base_token is not None and not force_full:
             # Echo back whatever token value we hold (int or str) as `since`.
             body["since"] = sess._base_token
-        data = self._request("POST", f"/sessions/{sess.session_id}/screenshot", json=body)
+        # Settle controls: keep the wire clean (default OFF) by sending these
+        # keys ONLY when actually requested — never send settle:false / null
+        # settle_ms, mirroring how max_width is omitted when None.
+        if settle_ms is not None:
+            body["settle_ms"] = settle_ms
+        if settle:
+            body["settle"] = True
+        if max_wait_ms is not None:
+            body["max_wait_ms"] = max_wait_ms
+        # Bump the per-request timeout if a settle cap could exceed the default
+        # (else None -> default timeout, non-settle calls untouched).
+        req_timeout = _settle_request_timeout(
+            settle, settle_ms, max_wait_ms, self.timeout
+        )
+        data = self._request(
+            "POST",
+            f"/sessions/{sess.session_id}/screenshot",
+            json=body,
+            timeout=req_timeout,
+        )
         return self._screenshot_from_response(
             sess, data, max_width=max_width, format=format, quality=quality
         )
@@ -647,6 +724,34 @@ def _png_height(png: bytes) -> int:
     if not _HAVE_PIL:
         return 0
     return Image.open(io.BytesIO(png)).height
+
+
+def _settle_request_timeout(
+    settle: bool, settle_ms: Optional[int], max_wait_ms: Optional[int], base: float
+) -> Optional[float]:
+    """Per-request HTTP timeout for a (possibly) settle screenshot, or None.
+
+    A settle screenshot can block server-side up to ``max_wait_ms`` before the
+    server responds; the default 30 s client timeout would trip first if a caller
+    asks for a large cap. When settle is requested AND that server-side budget
+    plus a margin exceeds the client's default ``base`` timeout, return the larger
+    value (``max_wait_ms/1000 + SETTLE_TIMEOUT_MARGIN``) so the client waits long
+    enough; otherwise return ``None`` (keep the default — non-settle calls and
+    small caps are unaffected). The server cap defaults to ~2500 ms when settle is
+    on but ``max_wait_ms`` is omitted, which is well under 30 s, so the common
+    settle call still uses the default timeout.
+    """
+    # Settle is requested when an explicit positive settle_ms or settle:true.
+    requested = bool(
+        (isinstance(settle_ms, int) and not isinstance(settle_ms, bool) and settle_ms > 0)
+        or settle
+    )
+    if not requested:
+        return None
+    # The server's effective cap (DEFAULT ~2500 ms) when max_wait_ms is omitted.
+    cap_ms = max_wait_ms if (isinstance(max_wait_ms, int) and max_wait_ms > 0) else 2500
+    needed = cap_ms / 1000.0 + SETTLE_TIMEOUT_MARGIN
+    return needed if needed > base else None
 
 
 # ---- CLI sidecar cache ---------------------------------------------------

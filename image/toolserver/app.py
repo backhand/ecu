@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from .settle_logic import SettleDecider
 from .watch import register_watch_routes
 
 # Import the *latest* concrete ComputerTool directly from the module. Note the
@@ -106,6 +107,20 @@ DEFAULT_QUALITY = int(os.getenv("ECU_SHOT_QUALITY") or 75)
 # Map a request ``format`` to (Pillow format, response content tag). PNG is
 # lossless and ignores ``quality``; jpeg/webp are lossy.
 _FORMATS: dict[str, str] = {"jpeg": "JPEG", "webp": "WEBP", "png": "PNG"}
+
+# Capture-once-stable ("settle") defaults. Settle is OPT-IN and OFF by default;
+# these only apply when a request turns it on (``settle_ms``>0 or ``settle:true``).
+# When on, the screenshot path re-captures until the screen has been visually
+# unchanged (same tile-compare the diff protocol uses, on CONSECUTIVE captures)
+# for ``settle_ms``, then returns the latest frame — so a screenshot taken right
+# after an action (or during a page load) returns a SETTLED frame, not a
+# mid-render one. ``ECU_SETTLE_MAX_WAIT_MS`` is a hard cap on total wait so an
+# endlessly-animating screen (spinner/video) returns the latest frame at the cap
+# and never hangs. ``ECU_SETTLE_POLL_MS`` is the inter-capture sleep: small
+# enough to detect settle promptly, large enough not to spin.
+DEFAULT_SETTLE_MS = int(os.getenv("ECU_SETTLE_MS") or 300)
+DEFAULT_SETTLE_MAX_WAIT_MS = int(os.getenv("ECU_SETTLE_MAX_WAIT_MS") or 2500)
+DEFAULT_SETTLE_POLL_MS = int(os.getenv("ECU_SETTLE_POLL_MS") or 100)
 
 app = FastAPI(title="ECU tool server", version="1")
 
@@ -572,6 +587,16 @@ class ScreenshotBody(BaseModel):
     max_width: int | None = Field(default=None, gt=0)
     format: Literal["jpeg", "webp", "png"] | None = None
     quality: int | None = Field(default=None, ge=1, le=100)
+    # Capture-once-stable ("settle"). All optional and OFF by default: omitted
+    # -> capture immediately (today's behavior). ``settle_ms`` (or ``settle:
+    # true`` -> ~300 ms default) re-captures until the screen is visually
+    # unchanged for that long, returning a SETTLED frame instead of a mid-render
+    # one. ``max_wait_ms`` (default ~2500 ms) caps the total wait so an animating
+    # screen returns the latest frame and never hangs. ``ge=0`` for settle_ms (0
+    # is explicitly OFF); ``gt=0`` for max_wait_ms.
+    settle: bool | None = None
+    settle_ms: int | None = Field(default=None, ge=0)
+    max_wait_ms: int | None = Field(default=None, gt=0)
 
 
 class ClickBody(BaseModel):
@@ -617,9 +642,10 @@ class ActionsBody(BaseModel):
     the SAME fields as the matching single-action endpoint.
 
     ``screenshot`` mirrors ``ScreenshotBody`` (``since``/``mode``/``max_width``/
-    ``format``/``quality``); it is validated leniently here (the sub-fields are
-    resolved/clamped by ``_normalize_encoding`` when the capture runs) and is
-    only honored when every action succeeded.
+    ``format``/``quality``, plus the settle controls ``settle``/``settle_ms``/
+    ``max_wait_ms``); it is validated leniently here (the sub-fields are
+    resolved/clamped by ``_normalize_encoding`` / ``_resolve_settle_ms`` when the
+    capture runs) and is only honored when every action succeeded.
     """
 
     actions: list[dict]
@@ -753,6 +779,7 @@ async def _capture_screenshot(
     fmt: str | None,
     quality: int | None,
     max_width: int | None,
+    png: bytes | None = None,
 ) -> dict:
     """Capture a frame and resolve it to a ``full``/``diff``/``nochange`` dict.
 
@@ -764,11 +791,21 @@ async def _capture_screenshot(
     (callers map that to an error response). ``mode``/``since`` mirror
     ``ScreenshotBody``; ``fmt``/``quality``/``max_width`` are resolved via
     ``_normalize_encoding`` (which clamps), exactly as ``/screenshot`` does.
+
+    ``png`` lets a caller hand in an ALREADY-captured frame (the settled frame
+    from ``_capture_settled_png``): when provided the gate grab is skipped and
+    those exact bytes are used; when ``None`` (the default, the no-settle path)
+    the frame is grabbed through the gate exactly as before. Everything after
+    the grab — downscale, decode, and the full/diff/nochange decision — is
+    identical regardless of where the PNG came from, so the response shape is
+    byte-for-byte the same whether or not settle ran.
     """
     # Capture through the single-flight gate so concurrent capture requests
     # collapse onto one scrot (and never starve the loop that input handlers
-    # need). Input endpoints do NOT use the gate.
-    png = await _capture_gate.capture()
+    # need). Input endpoints do NOT use the gate. If a pre-captured (settled)
+    # frame was passed in, use it directly — no second grab.
+    if png is None:
+        png = await _capture_gate.capture()
 
     pil_fmt, q, mw = _normalize_encoding(fmt, quality, max_width)
 
@@ -806,6 +843,140 @@ async def _capture_screenshot(
     )
 
 
+# --- capture-once-stable ("settle") ----------------------------------------
+
+
+def _resolve_settle_ms(settle: bool | None, settle_ms: int | None) -> int:
+    """Resolve the request's settle controls to an effective settle window (ms).
+
+    The single rule both ``/screenshot`` and ``/actions`` use so they never
+    drift: a positive ``settle_ms`` is used verbatim; else ``settle: true`` is
+    sugar for the default window (``DEFAULT_SETTLE_MS``); else settle is OFF
+    (return 0). ``settle_ms == 0`` is explicitly OFF (it never means "settle
+    with a zero window"), so the default no-settle path stays exactly today's
+    behavior. ``bool`` is excluded from the int check because ``isinstance(True,
+    int)`` is True in Python and ``settle`` is a separate flag.
+    """
+    if isinstance(settle_ms, int) and not isinstance(settle_ms, bool) and settle_ms > 0:
+        return settle_ms
+    if settle:
+        return DEFAULT_SETTLE_MS
+    return 0
+
+
+async def _capture_settled_png(
+    settle_ms: int,
+    max_wait_ms: int | None = None,
+    poll_ms: int | None = None,
+) -> bytes:
+    """Re-capture until the screen is visually unchanged for ``settle_ms``, then
+    return the latest PNG bytes (or the latest at ``max_wait_ms``, never hang).
+
+    The settle loop, factored out so it holds NOTHING input needs and yields the
+    event loop throughout (protocol #4 — input must never block on a capture):
+
+      * EVERY grab goes through ``_capture_gate.capture()`` (single-flight), so
+        the settle polls coalesce with any concurrent ``/screenshot`` and never
+        launch overlapping scrots, and input handlers (which use the gate not at
+        all) are never blocked by it.
+      * The CPU-bound work per poll — decoding the PNG to RGB and the tile
+        compare against the PREVIOUS capture — runs in ``asyncio.to_thread``
+        (mirroring how ``_capture_screenshot`` wraps ``_prepare``), so the numpy/
+        PIL crunch is off the event loop.
+      * The waits between captures are ``asyncio.sleep`` (off the loop), not a
+        blocking sleep.
+
+    The comparison is between CONSECUTIVE captures ("is the screen still
+    moving?"), reusing the diff protocol's ``_changed_tile_grid`` — it is NOT
+    the diff-vs-client-base comparison (that happens later, when the final frame
+    goes through ``_capture_screenshot``). All but the final frame are throwaway.
+
+    Exit conditions, checked every iteration:
+      * unchanged for >= ``settle_ms``  -> settled, return the latest frame;
+      * total elapsed >= ``max_wait_ms`` -> capped, return the latest frame
+        regardless (an endlessly-animating screen returns here, never hangs).
+    """
+    max_wait = DEFAULT_SETTLE_MAX_WAIT_MS if max_wait_ms is None else int(max_wait_ms)
+    poll = DEFAULT_SETTLE_POLL_MS if poll_ms is None else int(poll_ms)
+    # A non-positive poll would busy-spin; floor it. The settle/cap arithmetic
+    # (incl. flooring the cap at the settle window) lives in SettleDecider.
+    poll = max(1, poll)
+
+    decider = SettleDecider(settle_ms, max_wait)
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+
+    prev_png = await _capture_gate.capture()
+    prev_rgb = await asyncio.to_thread(_decode_rgb, prev_png)
+    last_t = loop.time()
+
+    while True:
+        # Cap check first: if we're already at/over the budget, the latest frame
+        # we hold is the answer (this also bounds an endlessly-changing screen).
+        if decider.capped((loop.time() - start) * 1000.0):
+            return prev_png
+
+        await asyncio.sleep(poll / 1000.0)
+
+        cur_png = await _capture_gate.capture()
+        cur_rgb = await asyncio.to_thread(_decode_rgb, cur_png)
+
+        # Compare CONSECUTIVE captures: did any tile change since the last grab?
+        # A shape mismatch (resolution flip mid-settle) counts as "changed".
+        if cur_rgb.shape != prev_rgb.shape:
+            changed = True
+        else:
+            changed = bool(
+                await asyncio.to_thread(
+                    lambda: _changed_tile_grid(prev_rgb, cur_rgb, TILE_SIZE).any()
+                )
+            )
+
+        now = loop.time()
+        dt_ms = (now - last_t) * 1000.0
+        last_t = now
+        prev_png = cur_png
+        prev_rgb = cur_rgb
+
+        # Fold this grab into the accumulator: a change resets the unchanged
+        # timer, stillness adds dt toward the window; settled once it reaches it.
+        if decider.step(changed, dt_ms):
+            return prev_png
+
+
+async def _capture_with_settle(
+    since: int | None,
+    mode: str | None,
+    fmt: str | None,
+    quality: int | None,
+    max_width: int | None,
+    settle: bool | None,
+    settle_ms: int | None,
+    max_wait_ms: int | None,
+) -> dict:
+    """Resolve settle, optionally run the settle loop, then resolve the frame.
+
+    The shared entry point both ``POST /screenshot`` and the ``POST /actions``
+    trailing screenshot use, so they can never drift (mirrors how they already
+    share ``_capture_screenshot``):
+      * settle OFF (the default) -> a single ``_capture_screenshot(..., png=None)``
+        call: byte-for-byte identical to today, zero added latency on the
+        no-settle path (including the cheap nochange poll);
+      * settle ON -> grab the settled frame with ``_capture_settled_png`` and
+        hand it to ``_capture_screenshot(..., png=settled)`` so the SAME full/
+        diff/nochange decision, downscale, and lossy encode apply to the final
+        frame and the response shape is unchanged.
+    """
+    eff_settle_ms = _resolve_settle_ms(settle, settle_ms)
+    if eff_settle_ms <= 0:
+        # Default path: exactly today's single capture through the gate.
+        return await _capture_screenshot(since, mode, fmt, quality, max_width)
+    final_png = await _capture_settled_png(eff_settle_ms, max_wait_ms)
+    return await _capture_screenshot(
+        since, mode, fmt, quality, max_width, png=final_png
+    )
+
+
 @app.post("/screenshot")
 async def screenshot(body: ScreenshotBody) -> JSONResponse:
     """Capture a frame, downscale + lossy-encode it, and return it as ``full``,
@@ -830,8 +1001,15 @@ async def screenshot(body: ScreenshotBody) -> JSONResponse:
     complete frame before showing it to a model (it never sees a diff).
     """
     try:
-        payload = await _capture_screenshot(
-            body.since, body.mode, body.format, body.quality, body.max_width
+        payload = await _capture_with_settle(
+            body.since,
+            body.mode,
+            body.format,
+            body.quality,
+            body.max_width,
+            body.settle,
+            body.settle_ms,
+            body.max_wait_ms,
         )
     except ToolActionError as exc:
         return _err(str(exc))
@@ -1049,19 +1227,24 @@ async def actions(body: ActionsBody) -> JSONResponse:
             return JSONResponse({"results": results})
 
     # All actions succeeded. If a trailing screenshot was requested, capture it
-    # now with the same protocol /screenshot uses. NOTE: this capture happens
-    # immediately after the last action with NO settle/sleep, so the captured
-    # frame MAY precede the full render of the last action's on-screen effect
-    # (a capture-once-stable "settle" is a later protocol task).
+    # now with the same protocol /screenshot uses (via the shared
+    # ``_capture_with_settle``, so settle resolves identically here). By default
+    # the capture is immediate (no settle), so the captured frame MAY precede the
+    # full render of the last action's on-screen effect — pass ``settle_ms`` (or
+    # ``settle: true``) in the trailing ``screenshot`` dict to return a SETTLED
+    # frame instead (capped by ``max_wait_ms``).
     if body.screenshot is not None:
         shot = body.screenshot
         try:
-            payload = await _capture_screenshot(
+            payload = await _capture_with_settle(
                 shot.get("since"),
                 shot.get("mode"),
                 shot.get("format"),
                 shot.get("quality"),
                 shot.get("max_width"),
+                shot.get("settle"),
+                shot.get("settle_ms"),
+                shot.get("max_wait_ms"),
             )
         except ToolActionError as exc:
             # The actions all succeeded but the trailing capture itself failed

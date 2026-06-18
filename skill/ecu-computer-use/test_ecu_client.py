@@ -511,6 +511,128 @@ class BatchActionsTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Capture-once-stable ("settle"): the settle controls are forwarded to the wire
+# when requested, and the default-OFF wire stays clean.
+# --------------------------------------------------------------------------
+
+class SettleTest(unittest.TestCase):
+    def test_screenshot_forwards_settle_params(self):
+        """client.screenshot(..., settle_ms=350, max_wait_ms=4000) puts
+        settle_ms and max_wait_ms on the screenshot REQUEST so the server runs
+        the settle loop and caps the wait at the source."""
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, settle_ms=350, max_wait_ms=4000)
+        body = client.calls[-1]["body"]
+        self.assertEqual(body["settle_ms"], 350)
+        self.assertEqual(body["max_wait_ms"], 4000)
+
+    def test_settle_true_sugar_is_forwarded(self):
+        """settle=True (no settle_ms) forwards settle:true so the server applies
+        its default settle window."""
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, settle=True)
+        body = client.calls[-1]["body"]
+        self.assertTrue(body["settle"])
+        # No explicit settle_ms/max_wait_ms when only the sugar was used.
+        self.assertNotIn("settle_ms", body)
+        self.assertNotIn("max_wait_ms", body)
+
+    def test_plain_screenshot_omits_settle_keys(self):
+        """A plain screenshot (no settle) keeps the wire default-OFF: none of
+        settle/settle_ms/max_wait_ms appear in the request body."""
+        shown = _png(640, 400, (5, 5, 5))
+        client = ScriptedClient([
+            {"mode": "full", "frame_token": 1, "width": 640, "height": 400,
+             "native_width": 1280, "native_height": 800, "image": _b64(shown)},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess)
+        body = client.calls[-1]["body"]
+        self.assertNotIn("settle", body)
+        self.assertNotIn("settle_ms", body)
+        self.assertNotIn("max_wait_ms", body)
+
+    def test_actions_forwards_settle_in_screenshot_subdict(self):
+        """A trailing screenshot dict carrying settle_ms is forwarded inside the
+        actions() POST body's `screenshot` sub-dict, and the caller's dict is
+        NOT mutated."""
+        shown = _png(640, 400, (12, 34, 56))
+        client = ScriptedClient([
+            {"results": [{"ok": True}],
+             "screenshot": {
+                 "mode": "full", "frame_token": 7,
+                 "width": 640, "height": 400,
+                 "native_width": 1280, "native_height": 800,
+                 "image": _b64(shown)}},
+        ])
+        sess = Session(session_id="s1", status="ready")
+        shot_req = {"settle_ms": 300}
+        import copy
+        before = copy.deepcopy(shot_req)
+
+        out = client.actions(
+            sess, [{"action": "key", "keys": "Return"}], screenshot=shot_req
+        )
+
+        sent = client.calls[-1]["body"]
+        self.assertEqual(client.calls[-1]["path"], "/sessions/s1/actions")
+        # settle_ms forwarded verbatim inside the screenshot sub-dict.
+        self.assertEqual(sent["screenshot"]["settle_ms"], 300)
+        # The caller's screenshot dict was not mutated.
+        self.assertEqual(shot_req, before)
+        # The trailing frame still reconstructs through the normal path.
+        self.assertIsInstance(out["screenshot"], Screenshot)
+        self.assertEqual(out["screenshot"].mode, "full")
+
+    def test_settle_bumps_per_request_timeout_for_large_cap(self):
+        """A large max_wait_ms bumps the per-request HTTP timeout above the
+        client default (so the client waits for the server), while a plain
+        screenshot keeps the default timeout (no override)."""
+        # Drive the REAL _request -> _do_request so the timeout override is
+        # exercised; capture the timeout that reaches the requests call.
+        captured: dict = {}
+
+        class TimeoutProbeClient(ECUClient):
+            def __init__(self):
+                super().__init__(base_url="https://ecu.test", api_key="k_test")
+
+            def _do_request(self, method, path, timeout=None, **kwargs):
+                captured["timeout"] = timeout
+                # Return a canned full frame; don't hit the network.
+                shown = _png(64, 64, (1, 2, 3))
+                return {
+                    "mode": "full", "frame_token": 1, "width": 64, "height": 64,
+                    "native_width": 64, "native_height": 64, "image": _b64(shown),
+                }
+
+        client = TimeoutProbeClient()
+        sess = Session(session_id="s1", status="ready")
+
+        # 60 s cap -> timeout bumped to 60 + margin(10) = 70 (> default 30).
+        client.screenshot(sess, settle_ms=500, max_wait_ms=60000)
+        self.assertEqual(captured["timeout"], 70.0)
+
+        # Plain screenshot -> no override (None keeps the client default).
+        client.screenshot(sess)
+        self.assertIsNone(captured["timeout"])
+
+        # A small settle cap (default ~2500 ms) stays under the default 30 s
+        # timeout, so no override is applied there either.
+        client.screenshot(sess, settle=True)
+        self.assertIsNone(captured["timeout"])
+
+
+# --------------------------------------------------------------------------
 # Fix #5: CLI sidecar cache
 # --------------------------------------------------------------------------
 

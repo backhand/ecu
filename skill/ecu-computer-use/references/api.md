@@ -141,9 +141,11 @@ Request:
   are native screen pixels (the client scales each anchor before sending, same
   as the single-action path). A zero-`dx`/`dy` `scroll` is an accepted no-op.
 - `screenshot` (object, optional): a trailing-screenshot request mirroring the
-  `POST /screenshot` body (`since`, `mode`, `max_width`, `format`, `quality` —
-  all optional, same defaults). It is captured **only if every action
-  succeeded**.
+  `POST /screenshot` body (`since`, `mode`, `max_width`, `format`, `quality`,
+  plus the capture-once-stable `settle` / `settle_ms` / `max_wait_ms` — all
+  optional, same defaults and semantics as `POST /screenshot`). It is captured
+  **only if every action succeeded**. Put `settle_ms` (or `settle: true`) here
+  to make the trailing frame a **settled** capture (see below).
 
 Execution + error policy (**in order, stop on first error**): the actions run
 sequentially. If an action fails — a `ToolActionError` (bad key name, display
@@ -171,10 +173,14 @@ Response:
   `POST /screenshot` returns — see below); the client reconstructs it into a
   full frame the same way. When any action failed, this key is **absent**.
 
-The trailing screenshot is captured **immediately** after the last action with
-**no settle/sleep**, so it may show the screen *before* the last action's effect
-has fully rendered (a capture-once-stable "settle" is a later protocol step). If
-the in-batch frame is pre-render, take a follow-up `POST /screenshot` to confirm.
+By default the trailing screenshot is captured **immediately** after the last
+action with **no settle/sleep**, so it may show the screen *before* the last
+action's effect has fully rendered. To get a stable in-batch frame, pass
+`settle_ms` (or `settle: true`) in the trailing `screenshot` dict — the server
+then re-captures until the screen is unchanged for that window before returning
+(capped by `max_wait_ms`, default ~2500 ms, so it never hangs). See the
+capture-once-stable params under `POST /screenshot`. (Without settle, if the
+in-batch frame looks pre-render, take a follow-up `POST /screenshot` to confirm.)
 
 ## Screenshot protocol (diff-aware, downscaled + lossy at the source)
 
@@ -201,9 +207,32 @@ Request:
   **and** every diff region.
 - `quality` (integer 1–100, optional): lossy quality (default `75`; ignored for
   `png`). ~75 balances legibility and size for UI screenshots.
+- `settle` (bool, optional): **capture-once-stable.** Default **OFF** (omitted =
+  capture immediately, today's behavior — one grab, no extra latency). When
+  `true`, the server re-captures until the screen has been visually unchanged
+  for the settle window, then returns that **settled** frame instead of a
+  possibly mid-render one (a just-focused window before its content paints, a
+  page still loading). `settle: true` with no `settle_ms` uses a ~300 ms window.
+- `settle_ms` (integer ≥ 0, optional): the settle window in milliseconds
+  (implies settle). The screen must be unchanged for this long — compared
+  between **consecutive captures** on the same 64px tile grid the diff protocol
+  uses — to count as settled. `0`/omitted = settle OFF.
+- `max_wait_ms` (integer > 0, optional): hard cap on the **total** settle wait
+  (default ~2500 ms). An endlessly-animating screen (spinner, video, redraw
+  loop) returns the **latest** frame at the cap and **never hangs**. The cap is
+  checked every poll; it is floored at the settle window.
+
+When settle is on, the returned (settled or capped) frame still goes through the
+normal **full / diff / nochange** decision and the **downscale + lossy** encode,
+exactly like a non-settle capture — settle only changes *which* frame is
+resolved, never the response shape. (Settle compares consecutive captures to ask
+"is the screen still moving?"; the full/diff/nochange decision separately
+compares the final frame against the caller's `since` base.) The clients bump the
+per-request HTTP timeout when a large `max_wait_ms` is asked for, so the wait
+can't trip the client before the server responds.
 
 The defaults make a bare `{}` request return a lossy JPEG full-res frame
-(~20–60 KB) instead of the old ~1 MB PNG.
+(~20–60 KB) instead of the old ~1 MB PNG, captured immediately (no settle).
 
 Three response shapes, distinguished by `mode`. All non-`nochange` shapes carry
 the shown `width`/`height` (the downscaled size the images are in) **and** the
