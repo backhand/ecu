@@ -46,27 +46,31 @@ func TestSeedBootstrapKeyIdempotent(t *testing.T) {
 }
 
 // TestLookupKeyActiveAndDisabled verifies LookupKey for active, disabled, and
-// unknown keys.
+// unknown keys, including the C8 persistent_allowed capability return.
 func TestLookupKeyActiveAndDisabled(t *testing.T) {
 	st := openTestStore(t)
 
-	// Seeded bootstrap key is active.
+	// Seeded bootstrap key is active AND persistent-allowed (SeedBootstrapKey
+	// seeds persistent_allowed=1).
 	if err := st.SeedBootstrapKey("k_active"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	// Insert a disabled key directly.
+	// Insert a disabled key directly (persistent_allowed=0).
 	mustExec(t, st, `INSERT INTO api_keys (key, account, status, persistent_allowed, created_at) VALUES (?, ?, ?, ?, ?)`,
 		"k_disabled", "ops", "disabled", 0, time.Now().UTC().Format(time.RFC3339Nano))
+	// Insert an active key WITHOUT the persistent capability.
+	mustExec(t, st, `INSERT INTO api_keys (key, account, status, persistent_allowed, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"k_noperist", "ops", "active", 0, time.Now().UTC().Format(time.RFC3339Nano))
 
-	account, active, found, err := st.LookupKey("k_active")
+	account, active, persistentAllowed, found, err := st.LookupKey("k_active")
 	if err != nil {
 		t.Fatalf("LookupKey active: %v", err)
 	}
-	if !found || !active || account != "admin" {
-		t.Fatalf("active key: found=%v active=%v account=%q, want true/true/admin", found, active, account)
+	if !found || !active || account != "admin" || !persistentAllowed {
+		t.Fatalf("active key: found=%v active=%v account=%q persistentAllowed=%v, want true/true/admin/true", found, active, account, persistentAllowed)
 	}
 
-	_, active, found, err = st.LookupKey("k_disabled")
+	_, active, _, found, err = st.LookupKey("k_disabled")
 	if err != nil {
 		t.Fatalf("LookupKey disabled: %v", err)
 	}
@@ -74,7 +78,16 @@ func TestLookupKeyActiveAndDisabled(t *testing.T) {
 		t.Fatalf("disabled key: found=%v active=%v, want found=true active=false", found, active)
 	}
 
-	_, _, found, err = st.LookupKey("k_nope")
+	// Active but not persistent-allowed.
+	_, active, persistentAllowed, found, err = st.LookupKey("k_noperist")
+	if err != nil {
+		t.Fatalf("LookupKey k_noperist: %v", err)
+	}
+	if !found || !active || persistentAllowed {
+		t.Fatalf("non-persistent key: found=%v active=%v persistentAllowed=%v, want true/true/false", found, active, persistentAllowed)
+	}
+
+	_, _, _, found, err = st.LookupKey("k_nope")
 	if err != nil {
 		t.Fatalf("LookupKey unknown: %v", err)
 	}
@@ -258,6 +271,68 @@ CREATE TABLE sessions (
 	got, found, err := st.SessionByTunnelToken(tok)
 	if err != nil || !found || got.ID != id {
 		t.Fatalf("post-migration token lookup failed: found=%v err=%v", found, err)
+	}
+
+	// Opening again must be a no-op (idempotent) and not error.
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open (idempotent migration): %v", err)
+	}
+	st2.Close()
+}
+
+// TestPersistColumnsMigrationFromLegacy verifies the C8 idempotent ALTER path: a
+// sessions table created WITHOUT snapshot_image / stopped_at (a pre-C8 DB) is
+// migrated on Open so both columns exist and a persistent stop round-trips. It
+// mirrors TestTunnelTokenMigration (which created a table missing tunnel_token);
+// here we use a post-C5 legacy table that already has tunnel_lost_at but lacks
+// the two C8 columns.
+func TestPersistColumnsMigrationFromLegacy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy_c5.db")
+
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	// A post-C5 table: has tunnel_token / instance_id / tunnel_lost_at but NOT the
+	// two C8 columns.
+	const legacySessions = `
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, account TEXT NOT NULL, status TEXT NOT NULL,
+    tool_endpoint TEXT NOT NULL, persistent INTEGER NOT NULL,
+    width INTEGER NOT NULL, height INTEGER NOT NULL,
+    created_at TEXT NOT NULL, last_activity_at TEXT NOT NULL,
+    tunnel_token TEXT NOT NULL DEFAULT '', instance_id TEXT NOT NULL DEFAULT '',
+    tunnel_lost_at TEXT NOT NULL DEFAULT ''
+);`
+	if _, err := raw.Exec(legacySessions); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	raw.Close()
+
+	// Open via the store: the migration must add snapshot_image + stopped_at.
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrating): %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// A persistent stop now works end-to-end (would fail at the UPDATE/SELECT if a
+	// column were missing).
+	id, _ := NewSessionID()
+	if err := st.CreateSession(&Session{
+		ID: id, Account: "admin", Status: "ready", ToolEndpoint: "",
+		Persistent: true, Width: 1, Height: 1,
+	}); err != nil {
+		t.Fatalf("CreateSession after migration: %v", err)
+	}
+	if err := st.MarkSessionStopped(id, "fake-image-x"); err != nil {
+		t.Fatalf("MarkSessionStopped after migration: %v", err)
+	}
+	got, found, err := st.GetSession(id)
+	if err != nil || !found || got.SnapshotImage != "fake-image-x" || got.StoppedAt.IsZero() {
+		t.Fatalf("post-migration stop round-trip failed: found=%v err=%v snap=%q stoppedAt=%v", found, err, got.SnapshotImage, got.StoppedAt)
 	}
 
 	// Opening again must be a no-op (idempotent) and not error.

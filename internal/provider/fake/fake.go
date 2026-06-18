@@ -39,13 +39,24 @@ type Provider struct {
 	images    []ImageCall
 	firewalls [][]provider.FirewallRule
 
+	// deletedImages records DeleteImage refs in call order (including repeats),
+	// the snapshot analogue of `deleted`. C8 cull / prior-snapshot-replace tests
+	// assert a specific snapshot ref was destroyed.
+	deletedImages []string
+
 	// CreateErr, when non-nil, makes CreateInstance fail with it (and record
 	// nothing as created). Set before the call.
 	CreateErr error
 
 	// CreateImageErr, when non-nil, makes CreateImage fail with it (and record
-	// nothing). Lets C7 bake tests exercise the snapshot-failure teardown path.
+	// nothing). Lets C7 bake tests exercise the snapshot-failure teardown path
+	// and C8 the snapshot-failure-on-end / reaper-preserve-state paths.
 	CreateImageErr error
+
+	// DeleteImageErr, when non-nil, makes DeleteImage fail with it (and record
+	// nothing). Lets a C8 test exercise the best-effort prior-snapshot-delete
+	// failure path.
+	DeleteImageErr error
 
 	// FindImageResult, when set, is what FindImage returns. The default (nil)
 	// keeps the historical behavior of always reporting the image absent. C7
@@ -164,6 +175,19 @@ func (p *Provider) CreateImage(_ context.Context, fromInstance, name string) (pr
 	return provider.Image{ID: "fake-image-" + name, Name: name}, nil
 }
 
+// DeleteImage records the ref and is idempotent: deleting an unknown ref (or
+// the same ref twice) returns nil, unless DeleteImageErr is set (then it fails
+// and records nothing). Mirrors DeleteInstance.
+func (p *Provider) DeleteImage(_ context.Context, ref string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.DeleteImageErr != nil {
+		return p.DeleteImageErr
+	}
+	p.deletedImages = append(p.deletedImages, ref)
+	return nil
+}
+
 // FindImage returns FindImageResult if set, else reports the image absent (the
 // historical default). The name is ignored: tests set the canned result they
 // want for the single image under test.
@@ -236,6 +260,26 @@ func (p *Provider) ImageCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.images)
+}
+
+// DeletedImage reports whether DeleteImage was ever called with ref.
+func (p *Provider) DeletedImage(ref string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, d := range p.deletedImages {
+		if d == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// DeletedImageCount returns how many times DeleteImage was called (including
+// repeats on the same ref).
+func (p *Provider) DeletedImageCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.deletedImages)
 }
 
 // Deleted reports whether DeleteInstance was ever called with id.

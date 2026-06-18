@@ -185,6 +185,20 @@ func fileConfigToConfig(fc *fileConfig) (*Config, error) {
 		}
 		c.ReapInterval = d
 	}
+	if fc.PersistentMaxLifetime != "" {
+		d, err := time.ParseDuration(fc.PersistentMaxLifetime)
+		if err != nil {
+			return nil, fmt.Errorf("config file persistent_max_lifetime: invalid duration %q: %w", fc.PersistentMaxLifetime, err)
+		}
+		c.PersistentMaxLifetime = d
+	}
+	if fc.PersistentMaxAge != "" {
+		d, err := time.ParseDuration(fc.PersistentMaxAge)
+		if err != nil {
+			return nil, fmt.Errorf("config file persistent_max_age: invalid duration %q: %w", fc.PersistentMaxAge, err)
+		}
+		c.PersistentMaxAge = d
+	}
 	return c, nil
 }
 
@@ -237,6 +251,12 @@ func configToFileConfig(cfg *Config) *fileConfig {
 	}
 	if cfg.ReapInterval != 0 {
 		fc.ReapInterval = cfg.ReapInterval.String()
+	}
+	if cfg.PersistentMaxLifetime != 0 {
+		fc.PersistentMaxLifetime = cfg.PersistentMaxLifetime.String()
+	}
+	if cfg.PersistentMaxAge != 0 {
+		fc.PersistentMaxAge = cfg.PersistentMaxAge.String()
 	}
 	if cfg.ProvisionTimeout != 0 {
 		fc.ProvisionTimeout = cfg.ProvisionTimeout.String()

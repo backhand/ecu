@@ -19,9 +19,12 @@ func bakeCallbackExempt(path string) bool {
 // values stored under it cannot collide with keys from other packages.
 type ctxKey int
 
-// accountKey is the context key under which the authenticated account is
-// stored.
-const accountKey ctxKey = iota
+// Context keys attached by authMiddleware. accountKey holds the authenticated
+// account; persistentAllowedKey holds the key's persistent capability (C8).
+const (
+	accountKey ctxKey = iota
+	persistentAllowedKey
+)
 
 // accountFromContext returns the authenticated account attached by
 // authMiddleware. The bool is false if no account is present (which should not
@@ -29,6 +32,15 @@ const accountKey ctxKey = iota
 func accountFromContext(ctx context.Context) (string, bool) {
 	acct, ok := ctx.Value(accountKey).(string)
 	return acct, ok
+}
+
+// persistentAllowedFromContext returns whether the authenticated API key is
+// authorized for persistent sessions (C8), attached by authMiddleware. A
+// missing value reads as false (not authorized), so a handler reached outside
+// the middleware fails closed.
+func persistentAllowedFromContext(ctx context.Context) bool {
+	allowed, _ := ctx.Value(persistentAllowedKey).(bool)
+	return allowed
 }
 
 // agentConnectPath is the tunnel-ingress route that authenticates with a
@@ -62,7 +74,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 			return
 		}
-		account, active, found, err := s.store.LookupKey(key)
+		account, active, persistentAllowed, found, err := s.store.LookupKey(key)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -73,6 +85,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), accountKey, account)
+		ctx = context.WithValue(ctx, persistentAllowedKey, persistentAllowed)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

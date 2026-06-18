@@ -463,6 +463,60 @@ func TestCreateImage(t *testing.T) {
 	}
 }
 
+// --- DeleteImage -------------------------------------------------------------
+
+// TestDeleteImageSuccess verifies DELETE /images/{id} is called and a success
+// response returns nil.
+func TestDeleteImageSuccess(t *testing.T) {
+	var deleted bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /images/555", func(w http.ResponseWriter, r *http.Request) {
+		deleted = true
+		// Image.Delete expects no body (204-style); an empty 200 is fine.
+		w.WriteHeader(http.StatusNoContent)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	p := newTestProvider(t, ts, provider.Config{})
+	if err := p.DeleteImage(t.Context(), "555"); err != nil {
+		t.Fatalf("DeleteImage: %v", err)
+	}
+	if !deleted {
+		t.Fatalf("DELETE /images/555 was not called")
+	}
+}
+
+// TestDeleteImageNotFoundIsIdempotent verifies a 404 not_found is treated as
+// success (nil) so culling can be retried safely.
+func TestDeleteImageNotFoundIsIdempotent(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /images/555", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found","message":"image not found"}}`)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	p := newTestProvider(t, ts, provider.Config{})
+	if err := p.DeleteImage(t.Context(), "555"); err != nil {
+		t.Fatalf("DeleteImage on 404 not_found must be nil (idempotent), got %v", err)
+	}
+}
+
+// TestDeleteImageBadRef verifies a non-numeric ref never wedges the cull (a
+// snapshot is always referenced by numeric id, so a bad ref can name no image).
+func TestDeleteImageBadRef(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request for a bad image ref: %s %s", r.Method, r.URL.Path)
+	}))
+	defer ts.Close()
+
+	p := newTestProvider(t, ts, provider.Config{})
+	if err := p.DeleteImage(t.Context(), "fake-image-ecu-persist-s_x"); err != nil {
+		t.Fatalf("DeleteImage with a non-numeric ref must be nil, got %v", err)
+	}
+}
+
 // --- EnsureFirewall ----------------------------------------------------------
 
 // TestEnsureFirewallCreatesDefault verifies that with no existing firewall,

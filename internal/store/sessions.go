@@ -40,6 +40,22 @@ type Session struct {
 	// window so a session that briefly loses its tunnel gets a fresh grace
 	// period rather than being measured from its original creation.
 	TunnelLostAt time.Time
+
+	// SnapshotImage is the provider snapshot ref (image id) holding a persistent
+	// session's saved desktop state while it is 'stopped' (C8). It is set when a
+	// persistent session is snapshotted+stopped (by DELETE or the reaper) and is
+	// the boot image a restore of this session uses. Empty means none (an active
+	// or ephemeral session, or a stopped one whose snapshot was culled). Each
+	// persistent session keeps at most one snapshot: taking a new one deletes the
+	// prior ref.
+	SnapshotImage string
+
+	// StoppedAt is the instant a persistent session was snapshotted+stopped
+	// (C8). The zero value (stored as the empty string) means "not stopped". The
+	// reaper measures the cull age (ECU_PERSISTENT_MAX_AGE) from THIS, not from
+	// CreatedAt: a long-lived persistent session that was only just stopped must
+	// not be culled as though it were old.
+	StoppedAt time.Time
 }
 
 // CreateSession inserts a new session row. created_at and last_activity_at are
@@ -53,14 +69,17 @@ func (s *Store) CreateSession(sess *Session) error {
 	// A freshly-created session has a live (or imminent) tunnel, so tunnel_lost_at
 	// starts empty (never lost). It is stamped only when an established tunnel
 	// later closes.
+	// snapshot_image / stopped_at start empty: a freshly-created session is never
+	// 'stopped' (those are written only when a persistent session is later
+	// snapshotted+stopped).
 	const q = `
 INSERT INTO sessions
-    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+    (id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at, snapshot_image, stopped_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	_, err := s.db.Exec(q,
 		sess.ID, sess.Account, sess.Status, sess.ToolEndpoint, boolToInt(sess.Persistent),
 		sess.Width, sess.Height,
-		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken, sess.InstanceID, "",
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sess.TunnelToken, sess.InstanceID, "", "", "",
 	)
 	if err != nil {
 		return fmt.Errorf("store: creating session: %w", err)
@@ -71,7 +90,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 // sessionColumns is the canonical column list (and order) shared by every
 // session SELECT so the scan targets in scanSession stay in lockstep with the
 // queries. Keep this in sync with the CreateSession INSERT column list.
-const sessionColumns = `id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at`
+const sessionColumns = `id, account, status, tool_endpoint, persistent, width, height, created_at, last_activity_at, tunnel_token, instance_id, tunnel_lost_at, snapshot_image, stopped_at`
 
 // scanSession scans one sessions row (selected via sessionColumns, in that
 // order) into a Session, decoding the 0/1 persistent flag and parsing the
@@ -81,13 +100,14 @@ const sessionColumns = `id, account, status, tool_endpoint, persistent, width, h
 // Scan); callers handle ErrNoRows / iteration themselves.
 func scanSession(src interface{ Scan(...any) error }) (Session, error) {
 	var (
-		out                                 Session
-		persistentInt                       int
-		createdAtStr, lastActStr, lostAtStr string
+		out                                             Session
+		persistentInt                                   int
+		createdAtStr, lastActStr, lostAtStr, stoppedStr string
 	)
 	if err := src.Scan(
 		&out.ID, &out.Account, &out.Status, &out.ToolEndpoint, &persistentInt,
 		&out.Width, &out.Height, &createdAtStr, &lastActStr, &out.TunnelToken, &out.InstanceID, &lostAtStr,
+		&out.SnapshotImage, &stoppedStr,
 	); err != nil {
 		return Session{}, err
 	}
@@ -101,6 +121,9 @@ func scanSession(src interface{ Scan(...any) error }) (Session, error) {
 	}
 	if out.TunnelLostAt, err = parseTimestamp(lostAtStr); err != nil {
 		return Session{}, fmt.Errorf("store: parsing tunnel_lost_at: %w", err)
+	}
+	if out.StoppedAt, err = parseTimestamp(stoppedStr); err != nil {
+		return Session{}, fmt.Errorf("store: parsing stopped_at: %w", err)
 	}
 	return out, nil
 }
@@ -146,6 +169,16 @@ func (s *Store) UpdateSessionStatus(id, status string) error {
 func (s *Store) UpdateSessionInstanceID(id, instanceID string) error {
 	if _, err := s.db.Exec(`UPDATE sessions SET instance_id = ? WHERE id = ?;`, instanceID, id); err != nil {
 		return fmt.Errorf("store: updating session instance id: %w", err)
+	}
+	return nil
+}
+
+// UpdateSessionToolEndpoint sets a session's tool_endpoint (the URL the proxy
+// forwards to). It is used by the C8 dev-mode restore path to re-point a
+// reactivated session back at the dev tool server. No-op for unknown ids.
+func (s *Store) UpdateSessionToolEndpoint(id, endpoint string) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET tool_endpoint = ? WHERE id = ?;`, endpoint, id); err != nil {
+		return fmt.Errorf("store: updating session tool endpoint: %w", err)
 	}
 	return nil
 }
@@ -271,6 +304,97 @@ func (s *Store) CountActiveSessionsForAccount(account string) (int, error) {
 		return 0, fmt.Errorf("store: counting active sessions for account: %w", err)
 	}
 	return n, nil
+}
+
+// MarkSessionStopped transitions a persistent session to the restorable
+// 'stopped' state in a single UPDATE: it sets status='stopped', records the
+// snapshot ref holding its saved state, and stamps stopped_at=now (UTC,
+// RFC3339Nano) as the basis for the reaper's cull age. It is a no-op (no error)
+// for unknown ids. The status literal is duplicated here (the store is
+// otherwise status-agnostic) to keep this an atomic write of the three coupled
+// fields; the canonical constant lives in controlplane.
+func (s *Store) MarkSessionStopped(id, snapshotRef string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(
+		`UPDATE sessions SET status = 'stopped', snapshot_image = ?, stopped_at = ? WHERE id = ?;`,
+		snapshotRef, now, id,
+	); err != nil {
+		return fmt.Errorf("store: marking session stopped: %w", err)
+	}
+	return nil
+}
+
+// UpdateSessionSnapshotImage sets a session's snapshot_image ref. It is used
+// when the snapshot ref must be written independently of the stop transition
+// (MarkSessionStopped already writes it in the common case). No-op for unknown
+// ids.
+func (s *Store) UpdateSessionSnapshotImage(id, ref string) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET snapshot_image = ? WHERE id = ?;`, ref, id); err != nil {
+		return fmt.Errorf("store: updating session snapshot image: %w", err)
+	}
+	return nil
+}
+
+// ReactivateSessionForRestore re-activates a previously 'stopped' persistent
+// session for a restore (C8): it sets status='provisioning', installs a fresh
+// tunnel token, and clears the instance_id / tunnel_lost_at / stopped_at fields
+// so the row looks like a brand-new provisioning session bound to the same id
+// and account. snapshot_image is INTENTIONALLY preserved: it is the saved state
+// the restore boots from, and is only replaced when the session is next ended.
+// No-op for unknown ids. The status literal is duplicated here for an atomic
+// reset; the canonical constant lives in controlplane.
+func (s *Store) ReactivateSessionForRestore(id, newTunnelToken string) error {
+	if _, err := s.db.Exec(
+		`UPDATE sessions SET status = 'provisioning', tunnel_token = ?, instance_id = '', tunnel_lost_at = '', stopped_at = '' WHERE id = ?;`,
+		newTunnelToken, id,
+	); err != nil {
+		return fmt.Errorf("store: reactivating session for restore: %w", err)
+	}
+	return nil
+}
+
+// CountNonTerminatedPersistentSessions returns the number of persistent
+// sessions NOT in the terminal 'terminated' status. This is the basis for the
+// ECU_MAX_PERSISTENT_SESSIONS cap: a persistent session occupies a slot while
+// provisioning, ready, OR stopped (a stopped session still holds saved state
+// and a snapshot, so it counts until it is culled to 'terminated'). Only
+// 'terminated' frees a slot.
+func (s *Store) CountNonTerminatedPersistentSessions() (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE persistent = 1 AND status != 'terminated';`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: counting non-terminated persistent sessions: %w", err)
+	}
+	return n, nil
+}
+
+// ListStoppedPersistentSessions returns every persistent session in the
+// 'stopped' state, fully parsed and ordered by when it was stopped. This is the
+// reaper's cull-candidate input: a stopped session holds only a stored snapshot
+// (no instance), and is culled (snapshot deleted, marked terminated) once its
+// StoppedAt is older than ECU_PERSISTENT_MAX_AGE.
+func (s *Store) ListStoppedPersistentSessions() ([]Session, error) {
+	q := `SELECT ` + sessionColumns + `
+FROM sessions WHERE persistent = 1 AND status = 'stopped' ORDER BY stopped_at;`
+	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("store: listing stopped persistent sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scanning stopped persistent session: %w", err)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterating stopped persistent sessions: %w", err)
+	}
+	return out, nil
 }
 
 // boolToInt maps a Go bool to the 0/1 INTEGER convention used in the schema.

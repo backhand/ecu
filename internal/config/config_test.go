@@ -248,3 +248,80 @@ func TestResolvePreBakeSettings(t *testing.T) {
 		t.Fatalf("cfg.ContainerImage = %q, want file value (file beats default)", cfg.ContainerImage)
 	}
 }
+
+// TestResolvePersistenceSettings exercises the C8 persistence settings:
+// ECU_MAX_PERSISTENT_SESSIONS (int) and the two durations
+// ECU_PERSISTENT_MAX_LIFETIME / ECU_PERSISTENT_MAX_AGE — defaults when unset,
+// parsing from env, env>file precedence, and an invalid duration erroring.
+func TestResolvePersistenceSettings(t *testing.T) {
+	base := map[string]string{"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000"}
+
+	// Defaults when unset.
+	cfg, _, err := resolve(base, nil, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.MaxPersistentSessions != defaultMaxPersistentSessions {
+		t.Fatalf("cfg.MaxPersistentSessions = %d, want default %d", cfg.MaxPersistentSessions, defaultMaxPersistentSessions)
+	}
+	if cfg.PersistentMaxLifetime != defaultPersistentMaxLifetime {
+		t.Fatalf("cfg.PersistentMaxLifetime = %v, want default %v", cfg.PersistentMaxLifetime, defaultPersistentMaxLifetime)
+	}
+	if cfg.PersistentMaxAge != defaultPersistentMaxAge {
+		t.Fatalf("cfg.PersistentMaxAge = %v, want default %v", cfg.PersistentMaxAge, defaultPersistentMaxAge)
+	}
+
+	// Parse from env.
+	env := map[string]string{
+		"ECU_API_KEY":                 "k",
+		"ECU_DEV_TOOLSERVER":          "http://127.0.0.1:8000",
+		"ECU_MAX_PERSISTENT_SESSIONS": "5",
+		"ECU_PERSISTENT_MAX_LIFETIME": "12h",
+		"ECU_PERSISTENT_MAX_AGE":      "72h",
+	}
+	cfg, _, err = resolve(env, nil, false, requiredKeys)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.MaxPersistentSessions != 5 {
+		t.Fatalf("cfg.MaxPersistentSessions = %d, want 5", cfg.MaxPersistentSessions)
+	}
+	if cfg.PersistentMaxLifetime != 12*time.Hour {
+		t.Fatalf("cfg.PersistentMaxLifetime = %v, want 12h", cfg.PersistentMaxLifetime)
+	}
+	if cfg.PersistentMaxAge != 72*time.Hour {
+		t.Fatalf("cfg.PersistentMaxAge = %v, want 72h", cfg.PersistentMaxAge)
+	}
+
+	// env > file precedence for the durations and the int.
+	cfg, _, err = resolve(
+		map[string]string{
+			"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+			"ECU_PERSISTENT_MAX_LIFETIME": "6h", "ECU_MAX_PERSISTENT_SESSIONS": "9",
+		},
+		&Config{PersistentMaxLifetime: 99 * time.Hour, PersistentMaxAge: 48 * time.Hour, MaxPersistentSessions: 1},
+		false, requiredKeys,
+	)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if cfg.PersistentMaxLifetime != 6*time.Hour {
+		t.Fatalf("cfg.PersistentMaxLifetime = %v, want env 6h (env beats file)", cfg.PersistentMaxLifetime)
+	}
+	if cfg.MaxPersistentSessions != 9 {
+		t.Fatalf("cfg.MaxPersistentSessions = %d, want env 9 (env beats file)", cfg.MaxPersistentSessions)
+	}
+	// PersistentMaxAge only in file -> file value used (file beats default).
+	if cfg.PersistentMaxAge != 48*time.Hour {
+		t.Fatalf("cfg.PersistentMaxAge = %v, want file 48h (file beats default)", cfg.PersistentMaxAge)
+	}
+
+	// Invalid duration errors.
+	bad := map[string]string{
+		"ECU_API_KEY": "k", "ECU_DEV_TOOLSERVER": "http://127.0.0.1:8000",
+		"ECU_PERSISTENT_MAX_AGE": "not-a-duration",
+	}
+	if _, _, err := resolve(bad, nil, false, requiredKeys); err == nil {
+		t.Fatalf("resolve accepted an invalid ECU_PERSISTENT_MAX_AGE, want error")
+	}
+}

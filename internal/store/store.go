@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at TEXT NOT NULL,             -- RFC3339Nano
     tunnel_token     TEXT NOT NULL DEFAULT '',  -- opaque per-session token an agent presents at /agent/connect (C3)
     instance_id      TEXT NOT NULL DEFAULT '',  -- provider instance id backing this session, set on provisioning (C4); '' in dev mode
-    tunnel_lost_at   TEXT NOT NULL DEFAULT ''   -- RFC3339Nano instant the LIVE tunnel was last lost; '' = never lost / currently connected. The C5 reaper measures the orphan/reconnect window from this (or boot); cleared to '' when an agent (re)connects.
+    tunnel_lost_at   TEXT NOT NULL DEFAULT '',  -- RFC3339Nano instant the LIVE tunnel was last lost; '' = never lost / currently connected. The C5 reaper measures the orphan/reconnect window from this (or boot); cleared to '' when an agent (re)connects.
+    snapshot_image   TEXT NOT NULL DEFAULT '',  -- C8: provider snapshot ref (image id) holding a persistent session's saved state while it is 'stopped'; '' = none. Restore boots from it; the next end replaces it.
+    stopped_at       TEXT NOT NULL DEFAULT ''   -- C8: RFC3339Nano instant a persistent session was snapshotted+stopped; '' = not stopped. The reaper's cull-age is measured from THIS (created_at is wrong for a stopped session).
 );
 
 -- Status index speeds the C5 reaper's repeated "non-terminal sessions" sweep
@@ -115,6 +117,16 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Same idempotent-migration pattern for the C8 snapshot_image column.
+	if err := ensureSessionSnapshotImage(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Same idempotent-migration pattern for the C8 stopped_at column.
+	if err := ensureSessionStoppedAt(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
@@ -146,6 +158,26 @@ func ensureSessionInstanceID(db *sql.DB) error {
 func ensureSessionTunnelLostAt(db *sql.DB) error {
 	return ensureSessionColumn(db, "tunnel_lost_at",
 		`ALTER TABLE sessions ADD COLUMN tunnel_lost_at TEXT NOT NULL DEFAULT '';`)
+}
+
+// ensureSessionSnapshotImage adds the sessions.snapshot_image column if a
+// pre-C8 database is missing it. Same idempotent pattern as the other ensure*
+// helpers, so it is safe to run on every Open. The column holds the provider
+// snapshot ref backing a 'stopped' persistent session's saved state (empty
+// when none); restore boots from it.
+func ensureSessionSnapshotImage(db *sql.DB) error {
+	return ensureSessionColumn(db, "snapshot_image",
+		`ALTER TABLE sessions ADD COLUMN snapshot_image TEXT NOT NULL DEFAULT '';`)
+}
+
+// ensureSessionStoppedAt adds the sessions.stopped_at column if a pre-C8
+// database is missing it. Same idempotent pattern as the other ensure*
+// helpers. The column records when a persistent session was snapshotted +
+// stopped; the reaper measures the cull age from it (created_at is wrong for a
+// long-lived persistent session that was only recently stopped).
+func ensureSessionStoppedAt(db *sql.DB) error {
+	return ensureSessionColumn(db, "stopped_at",
+		`ALTER TABLE sessions ADD COLUMN stopped_at TEXT NOT NULL DEFAULT '';`)
 }
 
 // ensureSessionColumn adds a column to the sessions table if it is absent. It

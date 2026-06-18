@@ -78,6 +78,12 @@ type Server struct {
 	// WithMaxSessions.
 	maxSessions int
 
+	// maxPersistentSessions is the cap on NON-TERMINATED persistent sessions
+	// (provisioning + ready + stopped) enforced by the persistent POST /sessions
+	// path (C8); a stopped session counts until it is culled. 0 means unlimited
+	// (no persistent cap). Set via WithMaxPersistentSessions.
+	maxPersistentSessions int
+
 	// now is the clock the reaper reads. It is time.Now in production and is
 	// overridden in tests (WithClock) so idle/lifetime/orphan windows can be
 	// driven deterministically without real sleeping. ONLY the reaper uses it;
@@ -182,6 +188,15 @@ func WithReaperConfig(cfg ReaperConfig) ServerOption {
 // count toward the cap.
 func WithMaxSessions(n int) ServerOption {
 	return func(s *Server) { s.maxSessions = n }
+}
+
+// WithMaxPersistentSessions sets the cap on NON-TERMINATED persistent sessions
+// (provisioning + ready + stopped) enforced by the persistent POST /sessions
+// path (C8). A value of 0 means UNLIMITED. A stopped session still counts (it
+// holds saved state + a snapshot) until it is culled to terminated, which is
+// the only transition that frees a slot.
+func WithMaxPersistentSessions(n int) ServerOption {
+	return func(s *Server) { s.maxPersistentSessions = n }
 }
 
 // WithClock overrides the clock the reaper reads (default time.Now). It exists

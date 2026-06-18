@@ -54,6 +54,14 @@ const (
 	defaultIdleTimeout  = 15 * time.Minute
 	defaultMaxLifetime  = 8 * time.Hour
 	defaultReapInterval = 1 * time.Minute
+	// C8 persistent-session reaper defaults. A persistent session gets a LONGER
+	// hard lifetime than an ephemeral one (it represents saved work, not a
+	// disposable desktop): when it ages out the reaper snapshots-and-stops it
+	// rather than destroying it. defaultPersistentMaxAge bounds how long a
+	// STOPPED persistent session's saved snapshot is retained (measured from when
+	// it was stopped) before it is culled (snapshot deleted, slot freed).
+	defaultPersistentMaxLifetime = 24 * time.Hour
+	defaultPersistentMaxAge      = 7 * 24 * time.Hour // 168h
 )
 
 // Config holds every ECU_* setting the control plane understands. All fields
@@ -148,8 +156,24 @@ type Config struct {
 
 	// MaxPersistentSessions caps concurrent persistent sessions
 	// (ECU_MAX_PERSISTENT_SESSIONS). Defaults to defaultMaxPersistentSessions.
-	// Enforced by the persistence component (C8).
+	// Enforced by the persistence component (C8). The cap counts every
+	// non-terminated persistent session (provisioning + ready + stopped); only a
+	// culled (terminated) session frees a slot.
 	MaxPersistentSessions int
+
+	// PersistentMaxLifetime is the hard lifetime ceiling for ACTIVE persistent
+	// sessions (ECU_PERSISTENT_MAX_LIFETIME), used by the C8 reaper INSTEAD of
+	// MaxLifetime for persistent sessions. When a persistent session ages out it
+	// is snapshotted-and-stopped (not destroyed). Defaults to
+	// defaultPersistentMaxLifetime; 0 disables persistent-lifetime reaping.
+	PersistentMaxLifetime time.Duration
+
+	// PersistentMaxAge bounds how long a STOPPED persistent session's saved
+	// snapshot is retained (ECU_PERSISTENT_MAX_AGE), measured from when it was
+	// stopped. Past it the C8 reaper culls the session: deletes the snapshot and
+	// marks it terminated (freeing a persistent-cap slot). Defaults to
+	// defaultPersistentMaxAge; 0 disables stopped-session culling.
+	PersistentMaxAge time.Duration
 
 	// DBPath is the filesystem path to the embedded SQLite database (ECU_DB).
 	// Defaults to defaultDBPath. A leading ~ is expanded to the user's home
@@ -193,6 +217,8 @@ type fileConfig struct {
 	MaxLifetime           string `json:"max_lifetime,omitempty"`
 	ReapInterval          string `json:"reap_interval,omitempty"`
 	MaxPersistentSessions int    `json:"max_persistent_sessions,omitempty"`
+	PersistentMaxLifetime string `json:"persistent_max_lifetime,omitempty"`
+	PersistentMaxAge      string `json:"persistent_max_age,omitempty"`
 	DBPath                string `json:"db_path,omitempty"`
 	DevToolServer         string `json:"dev_tool_server,omitempty"`
 }
@@ -342,6 +368,19 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	if c.ReapInterval, err = parseDurationSetting("ECU_REAP_INTERVAL", env["ECU_REAP_INTERVAL"], fileReapInterval); err != nil {
 		return nil, false, err
 	}
+	var filePersistMaxLife, filePersistMaxAge string
+	if fileCfg.PersistentMaxLifetime != 0 {
+		filePersistMaxLife = fileCfg.PersistentMaxLifetime.String()
+	}
+	if fileCfg.PersistentMaxAge != 0 {
+		filePersistMaxAge = fileCfg.PersistentMaxAge.String()
+	}
+	if c.PersistentMaxLifetime, err = parseDurationSetting("ECU_PERSISTENT_MAX_LIFETIME", env["ECU_PERSISTENT_MAX_LIFETIME"], filePersistMaxLife); err != nil {
+		return nil, false, err
+	}
+	if c.PersistentMaxAge, err = parseDurationSetting("ECU_PERSISTENT_MAX_AGE", env["ECU_PERSISTENT_MAX_AGE"], filePersistMaxAge); err != nil {
+		return nil, false, err
+	}
 	var fileProvTimeout string
 	if fileCfg.ProvisionTimeout != 0 {
 		fileProvTimeout = fileCfg.ProvisionTimeout.String()
@@ -370,6 +409,12 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	}
 	if c.ReapInterval == 0 {
 		c.ReapInterval = defaultReapInterval
+	}
+	if c.PersistentMaxLifetime == 0 {
+		c.PersistentMaxLifetime = defaultPersistentMaxLifetime
+	}
+	if c.PersistentMaxAge == 0 {
+		c.PersistentMaxAge = defaultPersistentMaxAge
 	}
 	if c.ProvisionTimeout == 0 {
 		c.ProvisionTimeout = defaultProvisionTimeout

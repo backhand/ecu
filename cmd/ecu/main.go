@@ -150,11 +150,18 @@ func runControlPlane() error {
 		// block below). OrphanGrace mirrors controlplane.defaultOrphanGrace
 		// (unexported, so the literal is repeated here).
 		controlplane.WithMaxSessions(cfg.MaxSessions),
+		// C8: the persistent-session cap and the persistent reaper lifetimes apply
+		// in BOTH dev and production (in dev there is no provider, so snapshot /
+		// teardown are no-ops, but the cap + status transitions are still correct),
+		// so they go on the base opts alongside the C5 cap/reaper.
+		controlplane.WithMaxPersistentSessions(cfg.MaxPersistentSessions),
 		controlplane.WithReaperConfig(controlplane.ReaperConfig{
-			IdleTimeout:  cfg.IdleTimeout,
-			MaxLifetime:  cfg.MaxLifetime,
-			ReapInterval: cfg.ReapInterval,
-			OrphanGrace:  2 * time.Minute, // mirrors controlplane.defaultOrphanGrace
+			IdleTimeout:           cfg.IdleTimeout,
+			MaxLifetime:           cfg.MaxLifetime,
+			ReapInterval:          cfg.ReapInterval,
+			OrphanGrace:           2 * time.Minute, // mirrors controlplane.defaultOrphanGrace
+			PersistentMaxLifetime: cfg.PersistentMaxLifetime,
+			PersistentMaxAge:      cfg.PersistentMaxAge,
 		}),
 	}
 

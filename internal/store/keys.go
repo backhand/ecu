@@ -45,20 +45,25 @@ ON CONFLICT(key) DO NOTHING;`
 	return nil
 }
 
-// LookupKey resolves a presented API key to its account and active state.
-// found is false when the key does not exist; active reflects status=='active'.
-// A non-existent key is not an error (found=false, err=nil).
-func (s *Store) LookupKey(key string) (account string, active bool, found bool, err error) {
-	const q = `SELECT account, status FROM api_keys WHERE key = ?;`
-	var status string
+// LookupKey resolves a presented API key to its account, active state, and the
+// persistent capability (C8). found is false when the key does not exist;
+// active reflects status=='active'; persistentAllowed reflects the
+// persistent_allowed 0/1 flag (whether this key may request/restore persistent
+// sessions). A non-existent key is not an error (found=false, err=nil).
+func (s *Store) LookupKey(key string) (account string, active bool, persistentAllowed bool, found bool, err error) {
+	const q = `SELECT account, status, persistent_allowed FROM api_keys WHERE key = ?;`
+	var (
+		status               string
+		persistentAllowedInt int
+	)
 	row := s.db.QueryRow(q, key)
-	switch err := row.Scan(&account, &status); {
+	switch err := row.Scan(&account, &status, &persistentAllowedInt); {
 	case errors.Is(err, sql.ErrNoRows):
-		return "", false, false, nil
+		return "", false, false, false, nil
 	case err != nil:
-		return "", false, false, fmt.Errorf("store: looking up key: %w", err)
+		return "", false, false, false, fmt.Errorf("store: looking up key: %w", err)
 	}
-	return account, status == "active", true, nil
+	return account, status == "active", persistentAllowedInt != 0, true, nil
 }
 
 // CountKeys returns the total number of api_keys rows. Primarily for tests and

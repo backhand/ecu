@@ -169,3 +169,180 @@ func TestTunnelLostAtColumnMigration(t *testing.T) {
 		t.Fatalf("GetSession after migration: found=%v err=%v lostAt=%v", found, err, sess)
 	}
 }
+
+// statusStoppedSeed mirrors the controlplane 'stopped' status literal for the
+// store tests (the store does not import the controlplane constants).
+const statusStoppedSeed = "stopped"
+
+// makePersistentSession inserts a PERSISTENT session row with the given id and
+// status, returning the created row. Mirrors makeSession but sets Persistent.
+func makePersistentSession(t *testing.T, st *Store, id, account, status string) *Session {
+	t.Helper()
+	if err := st.CreateSession(&Session{
+		ID: id, Account: account, Status: statusProvisioningSeed,
+		Persistent: true, Width: 1280, Height: 800,
+	}); err != nil {
+		t.Fatalf("CreateSession(%s): %v", id, err)
+	}
+	if status != statusProvisioningSeed {
+		if err := st.UpdateSessionStatus(id, status); err != nil {
+			t.Fatalf("UpdateSessionStatus(%s,%s): %v", id, status, err)
+		}
+	}
+	sess, found, err := st.GetSession(id)
+	if err != nil || !found {
+		t.Fatalf("GetSession(%s): found=%v err=%v", id, found, err)
+	}
+	return sess
+}
+
+// TestPersistColumnsMigration proves the C8 columns (snapshot_image, stopped_at)
+// exist after Open: a create + get that scans them would fail at the SELECT if
+// either column were absent. (openTestStore goes through Open, which runs
+// ensureSessionSnapshotImage + ensureSessionStoppedAt.)
+func TestPersistColumnsMigration(t *testing.T) {
+	st := openTestStore(t)
+	makeSession(t, st, "s_pmig", "admin", statusReadySeed)
+	sess, found, err := st.GetSession("s_pmig")
+	if err != nil || !found {
+		t.Fatalf("GetSession after migration: found=%v err=%v", found, err)
+	}
+	if sess.SnapshotImage != "" || !sess.StoppedAt.IsZero() {
+		t.Fatalf("fresh session SnapshotImage=%q StoppedAt=%v, want empty/zero", sess.SnapshotImage, sess.StoppedAt)
+	}
+}
+
+// TestMarkSessionStoppedRoundTrip verifies MarkSessionStopped writes status,
+// snapshot_image, and stopped_at atomically and they read back.
+func TestMarkSessionStoppedRoundTrip(t *testing.T) {
+	st := openTestStore(t)
+	makePersistentSession(t, st, "s_stop", "admin", statusReadySeed)
+
+	before := time.Now().UTC()
+	if err := st.MarkSessionStopped("s_stop", "fake-image-ecu-persist-s_stop"); err != nil {
+		t.Fatalf("MarkSessionStopped: %v", err)
+	}
+	after := time.Now().UTC()
+
+	sess, _, _ := st.GetSession("s_stop")
+	if sess.Status != statusStoppedSeed {
+		t.Fatalf("status = %q, want stopped", sess.Status)
+	}
+	if sess.SnapshotImage != "fake-image-ecu-persist-s_stop" {
+		t.Fatalf("snapshot_image = %q, want the snapshot ref", sess.SnapshotImage)
+	}
+	if sess.StoppedAt.Before(before) || sess.StoppedAt.After(after) {
+		t.Fatalf("stopped_at = %v, want within [%v,%v]", sess.StoppedAt, before, after)
+	}
+
+	// Unknown id is a silent no-op.
+	if err := st.MarkSessionStopped("s_missing", "x"); err != nil {
+		t.Fatalf("MarkSessionStopped(unknown): %v", err)
+	}
+}
+
+// TestCountNonTerminatedPersistentSessions verifies the persistent-cap count:
+// every non-terminated persistent session counts (provisioning + ready +
+// stopped); only terminated frees a slot, and ephemeral sessions never count.
+func TestCountNonTerminatedPersistentSessions(t *testing.T) {
+	st := openTestStore(t)
+
+	if n, err := st.CountNonTerminatedPersistentSessions(); err != nil || n != 0 {
+		t.Fatalf("empty store: count = %d, err = %v, want 0", n, err)
+	}
+
+	makePersistentSession(t, st, "p_prov", "admin", statusProvisioningSeed)
+	makePersistentSession(t, st, "p_ready", "admin", statusReadySeed)
+	makePersistentSession(t, st, "p_stopped", "admin", statusStoppedSeed)
+	makePersistentSession(t, st, "p_term", "admin", statusTerminatedSeed) // does NOT count
+	makeSession(t, st, "e_ready", "admin", statusReadySeed)               // ephemeral, does NOT count
+
+	n, err := st.CountNonTerminatedPersistentSessions()
+	if err != nil {
+		t.Fatalf("CountNonTerminatedPersistentSessions: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("count = %d, want 3 (provisioning + ready + stopped persistent; not terminated, not ephemeral)", n)
+	}
+}
+
+// TestListStoppedPersistentSessions verifies the cull-candidate list contains
+// only stopped persistent sessions and round-trips their snapshot ref +
+// stopped_at, ordered by stopped_at.
+func TestListStoppedPersistentSessions(t *testing.T) {
+	st := openTestStore(t)
+
+	// One stopped persistent (the candidate) with a snapshot ref.
+	makePersistentSession(t, st, "p_stopped", "admin", statusReadySeed)
+	if err := st.MarkSessionStopped("p_stopped", "fake-image-ecu-persist-p_stopped"); err != nil {
+		t.Fatalf("MarkSessionStopped: %v", err)
+	}
+	// Non-candidates: a ready persistent, a terminated persistent, an ephemeral
+	// session that is somehow 'stopped' (shouldn't occur, but the WHERE must
+	// require persistent=1).
+	makePersistentSession(t, st, "p_ready", "admin", statusReadySeed)
+	makePersistentSession(t, st, "p_term", "admin", statusTerminatedSeed)
+	makeSession(t, st, "e_stopped", "admin", statusStoppedSeed)
+
+	got, err := st.ListStoppedPersistentSessions()
+	if err != nil {
+		t.Fatalf("ListStoppedPersistentSessions: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d stopped persistent sessions, want 1: %+v", len(got), got)
+	}
+	if got[0].ID != "p_stopped" {
+		t.Fatalf("stopped list has %q, want p_stopped", got[0].ID)
+	}
+	if got[0].SnapshotImage != "fake-image-ecu-persist-p_stopped" {
+		t.Fatalf("snapshot ref = %q, want the stored ref", got[0].SnapshotImage)
+	}
+	if got[0].StoppedAt.IsZero() {
+		t.Fatalf("stopped_at is zero, want the stamped instant")
+	}
+}
+
+// TestReactivateSessionForRestore verifies the restore reset: status back to
+// provisioning, fresh tunnel token, instance_id / tunnel_lost_at / stopped_at
+// cleared, and snapshot_image PRESERVED (it is the saved state to boot from).
+func TestReactivateSessionForRestore(t *testing.T) {
+	st := openTestStore(t)
+	makePersistentSession(t, st, "p_restore", "admin", statusReadySeed)
+	// Give it an instance id + a lost stamp, then stop it with a snapshot.
+	if err := st.UpdateSessionInstanceID("p_restore", "fake-7"); err != nil {
+		t.Fatalf("UpdateSessionInstanceID: %v", err)
+	}
+	if err := st.SetSessionTunnelLost("p_restore", time.Now().UTC()); err != nil {
+		t.Fatalf("SetSessionTunnelLost: %v", err)
+	}
+	if err := st.MarkSessionStopped("p_restore", "fake-image-ecu-persist-p_restore"); err != nil {
+		t.Fatalf("MarkSessionStopped: %v", err)
+	}
+
+	if err := st.ReactivateSessionForRestore("p_restore", "t_newtoken"); err != nil {
+		t.Fatalf("ReactivateSessionForRestore: %v", err)
+	}
+	sess, _, _ := st.GetSession("p_restore")
+	if sess.Status != statusProvisioningSeed {
+		t.Fatalf("status = %q, want provisioning", sess.Status)
+	}
+	if sess.TunnelToken != "t_newtoken" {
+		t.Fatalf("tunnel_token = %q, want t_newtoken", sess.TunnelToken)
+	}
+	if sess.InstanceID != "" {
+		t.Fatalf("instance_id = %q, want cleared", sess.InstanceID)
+	}
+	if !sess.TunnelLostAt.IsZero() {
+		t.Fatalf("tunnel_lost_at = %v, want cleared", sess.TunnelLostAt)
+	}
+	if !sess.StoppedAt.IsZero() {
+		t.Fatalf("stopped_at = %v, want cleared", sess.StoppedAt)
+	}
+	// Snapshot ref must be PRESERVED — it is the saved state the restore boots from.
+	if sess.SnapshotImage != "fake-image-ecu-persist-p_restore" {
+		t.Fatalf("snapshot_image = %q, want preserved across restore", sess.SnapshotImage)
+	}
+	if !sess.Persistent {
+		t.Fatalf("session lost its persistent flag across restore")
+	}
+}

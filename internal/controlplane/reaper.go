@@ -43,6 +43,20 @@ type ReaperConfig struct {
 	// OrphanGrace is added to the provider's ProvisionTimeout to form the
 	// orphan/reconnect window (see defaultOrphanGrace).
 	OrphanGrace time.Duration
+
+	// PersistentMaxLifetime is the hard lifetime ceiling for ACTIVE PERSISTENT
+	// sessions, used INSTEAD of MaxLifetime for them (C8). It is deliberately
+	// LONGER (a persistent session holds saved work, not a disposable desktop):
+	// when it ages out the reaper snapshots-and-stops the session rather than
+	// destroying it. 0 disables persistent-lifetime reaping. The idle + orphan
+	// triggers stay SHARED across ephemeral and persistent.
+	PersistentMaxLifetime time.Duration
+
+	// PersistentMaxAge bounds how long a STOPPED persistent session's saved
+	// snapshot is retained, measured from StoppedAt (C8). Past it the reaper's
+	// cull pass deletes the snapshot and marks the session terminated (freeing a
+	// persistent-cap slot). 0 disables stopped-session culling.
+	PersistentMaxAge time.Duration
 }
 
 // RunReaper runs the reaping loop until ctx is cancelled. It is BLOCKING; main
@@ -83,88 +97,154 @@ func (s *Server) RunReaper(ctx context.Context) {
 	}
 }
 
-// reapOnce performs a single reaping sweep: it lists the non-terminal sessions
-// and, for each, applies the reaping rules in priority order, reaping the first
-// match. It is the unit the tests drive directly (advancing the injected clock
-// and calling reapOnce), so it must be side-effect-deterministic given the
-// store + registry + clock.
+// reapOnce performs a single reaping sweep. It runs TWO passes, both driven
+// directly by tests (advance the injected clock, call reapOnce), so each must be
+// side-effect-deterministic given the store + registry + clock:
 //
-// Rule priority (FIRST match wins):
-//
-//  1. lifetime — created_at older than MaxLifetime (hard ceiling).
-//  2. idle     — last_activity_at older than IdleTimeout.
-//  3. orphan   — no live tunnel for longer than the orphan/reconnect window,
-//     measured from max(created_at, tunnel_lost_at).
-//
-// A disabled timeout (0) simply never matches its rule. Idle/lifetime fire
-// regardless of tunnel liveness (a wedged-but-connected session is still
-// reaped); orphan fires ONLY when there is no live tunnel.
+//  1. The active-session sweep over ListNonTerminalSessions (provisioning +
+//     ready). For each, the FIRST matching rule wins:
+//     a. lifetime — created_at older than the lifetime ceiling. PERSISTENT
+//     sessions use the LONGER PersistentMaxLifetime; ephemeral use
+//     MaxLifetime. (A reaped persistent session is snapshot-and-stopped, not
+//     destroyed — see reapSession.)
+//     b. idle     — last_activity_at older than IdleTimeout (shared).
+//     c. orphan   — no live tunnel for longer than the orphan/reconnect window,
+//     measured from max(created_at, tunnel_lost_at) (shared).
+//     A disabled timeout (0) never matches its rule. Idle/lifetime fire
+//     regardless of tunnel liveness; orphan fires ONLY when there is no live
+//     tunnel. STOPPED sessions are not in this list (status='stopped' ∉
+//     provisioning,ready), so they are never idle/orphan-reaped — they have no
+//     instance to leak.
+//  2. The cull pass over ListStoppedPersistentSessions: a stopped persistent
+//     session whose StoppedAt is older than PersistentMaxAge is culled (snapshot
+//     deleted, marked terminated, freeing a persistent-cap slot).
 func (s *Server) reapOnce(ctx context.Context) {
+	now := s.now()
+
 	sessions, err := s.store.ListNonTerminalSessions()
 	if err != nil {
 		log.Printf("ecu reaper: list sessions: %v", err)
-		return
-	}
-	// Orphan window: a tunnel-less session gets the full provisioning window
-	// PLUS the reconnect grace before it is considered leaked.
-	provisionWindow := s.provisionCfg.ProvisionTimeout + s.reaperCfg.OrphanGrace
-	now := s.now()
-
-	for _, sess := range sessions {
-		reason := ""
-		switch {
-		case s.reaperCfg.MaxLifetime > 0 && now.Sub(sess.CreatedAt) > s.reaperCfg.MaxLifetime:
-			reason = "lifetime"
-		case s.reaperCfg.IdleTimeout > 0 && now.Sub(sess.LastActivityAt) > s.reaperCfg.IdleTimeout:
-			reason = "idle"
-		default:
-			// Orphan: only a candidate when there is NO live tunnel.
-			if tun, ok := s.registry.lookup(sess.ID); !ok || tun.IsClosed() {
-				orphanSince := sess.CreatedAt
-				if sess.TunnelLostAt.After(orphanSince) {
-					orphanSince = sess.TunnelLostAt
-				}
-				if now.Sub(orphanSince) > provisionWindow {
-					reason = "orphan"
+	} else {
+		// Orphan window: a tunnel-less session gets the full provisioning window
+		// PLUS the reconnect grace before it is considered leaked.
+		provisionWindow := s.provisionCfg.ProvisionTimeout + s.reaperCfg.OrphanGrace
+		for _, sess := range sessions {
+			// Lifetime ceiling depends on the session kind: persistent sessions get
+			// the longer PersistentMaxLifetime, ephemeral the standard MaxLifetime.
+			lifetime := s.reaperCfg.MaxLifetime
+			if sess.Persistent {
+				lifetime = s.reaperCfg.PersistentMaxLifetime
+			}
+			reason := ""
+			switch {
+			case lifetime > 0 && now.Sub(sess.CreatedAt) > lifetime:
+				reason = "lifetime"
+			case s.reaperCfg.IdleTimeout > 0 && now.Sub(sess.LastActivityAt) > s.reaperCfg.IdleTimeout:
+				reason = "idle"
+			default:
+				// Orphan: only a candidate when there is NO live tunnel.
+				if tun, ok := s.registry.lookup(sess.ID); !ok || tun.IsClosed() {
+					orphanSince := sess.CreatedAt
+					if sess.TunnelLostAt.After(orphanSince) {
+						orphanSince = sess.TunnelLostAt
+					}
+					if now.Sub(orphanSince) > provisionWindow {
+						reason = "orphan"
+					}
 				}
 			}
+			if reason == "" {
+				continue
+			}
+			s.reapSession(sess, reason)
 		}
-		if reason == "" {
+	}
+
+	s.cullStoppedOnce(now)
+}
+
+// cullStoppedOnce is reapOnce's second pass: it culls every STOPPED persistent
+// session whose saved snapshot has aged out (StoppedAt older than
+// PersistentMaxAge). PersistentMaxAge<=0 disables culling. Each cull deletes the
+// snapshot and marks the session terminated (freeing a persistent-cap slot); it
+// is idempotent and retry-safe (see cullStoppedSession).
+func (s *Server) cullStoppedOnce(now time.Time) {
+	if s.reaperCfg.PersistentMaxAge <= 0 {
+		return // culling disabled
+	}
+	stopped, err := s.store.ListStoppedPersistentSessions()
+	if err != nil {
+		log.Printf("ecu reaper: list stopped persistent sessions: %v", err)
+		return
+	}
+	for _, sess := range stopped {
+		// Measure age from StoppedAt (created_at is wrong for a long-lived session
+		// only recently stopped). A zero StoppedAt (shouldn't happen for a stopped
+		// row) is treated as not-yet-cullable rather than instantly culled.
+		if sess.StoppedAt.IsZero() {
 			continue
 		}
-		s.reapSession(sess, reason)
+		if now.Sub(sess.StoppedAt) > s.reaperCfg.PersistentMaxAge {
+			s.cullStoppedSession(sess)
+		}
 	}
 }
 
-// reapSession terminates one doomed session and tears down its backing
-// instance. It is idempotent and concurrency-safe against a parallel DELETE:
+// reapSession reaps one doomed ACTIVE session. It is idempotent and
+// concurrency-safe against a parallel DELETE: it RE-READS the session fresh and
+// does NOTHING if it is gone, already terminated, OR already stopped (a
+// concurrent DELETE / reap finished first — no double work, no duplicate log).
 //
-//   - It RE-READS the session fresh and does NOTHING if it is gone or already
-//     terminated (a concurrent DELETE finished first — no double-teardown, no
-//     duplicate log line).
-//   - It marks the session terminated BEFORE teardown so a racing
+// The reap action depends on the session kind:
+//
+//   - EPHEMERAL → destroy: mark terminated BEFORE teardown so a racing
 //     provisioning waiter / second reap observes the terminal state and backs
 //     off; instance protection comes first, so teardown proceeds even if the
-//     status write errors.
-//   - teardownInstance is itself idempotent (DeleteInstance tolerates an
-//     already-/concurrently-destroyed instance), so a double call is harmless.
+//     status write errors. teardownInstance is idempotent.
+//   - PERSISTENT → SNAPSHOT-AND-STOP (a reaped persistent session is an auto-end,
+//     not a destroy): snapshot the instance, then destroy it and mark the session
+//     'stopped' carrying the snapshot (snapshotAndStop). If the snapshot FAILS we
+//     PRESERVE STATE — log loudly and RETURN WITHOUT terminating or destroying,
+//     so the next sweep retries and no saved work is lost. The state transition
+//     (to 'stopped') happens only AFTER a successful snapshot, mirroring the
+//     ephemeral terminate-before-teardown invariant. A persistent session with no
+//     instance (shouldn't happen for an active one) is just marked stopped.
 func (s *Server) reapSession(sess store.Session, reason string) {
 	cur, found, err := s.store.GetSession(sess.ID)
 	if err != nil {
 		log.Printf("ecu reaper: re-read session %s: %v", sess.ID, err)
 		return
 	}
-	if !found || cur.Status == statusTerminated {
+	if !found || cur.Status == statusTerminated || cur.Status == statusStopped {
 		// A concurrent DELETE (or a prior reap) already finished. Nothing to do.
 		return
 	}
 
-	// Log exactly once per real reap, right after the terminated check.
-	log.Printf("ecu reaper: reaping session %s (reason=%s, instance=%s)", sess.ID, reason, cur.InstanceID)
+	// Log exactly once per real reap, right after the short-circuit checks.
+	log.Printf("ecu reaper: reaping session %s (reason=%s, persistent=%v, instance=%s)", sess.ID, reason, cur.Persistent, cur.InstanceID)
 
-	// Mark terminal FIRST (so racing actors observe it), then destroy the
-	// instance. Proceed to teardown even if the status write fails — protecting
-	// the paid instance is the priority.
+	if cur.Persistent {
+		if cur.InstanceID == "" || s.provider == nil {
+			// No instance to snapshot (e.g. a dev-mode persistent session, or one
+			// that never got an instance): there is nothing to preserve via a
+			// snapshot, so just stop it (no snapshot ref). It then ages out via the
+			// cull pass like any other stopped session.
+			if err := s.store.MarkSessionStopped(cur.ID, ""); err != nil {
+				log.Printf("ecu reaper: mark persistent session %s stopped (no instance): %v", cur.ID, err)
+			}
+			return
+		}
+		if err := s.snapshotAndStop(cur); err != nil {
+			// PRESERVE STATE: leave the instance running and the session active so
+			// the next sweep retries. Do NOT destroy or terminate.
+			log.Printf("ecu reaper: session %s: snapshot-and-stop FAILED, preserving state (instance %s left running, will retry): %v", cur.ID, cur.InstanceID, err)
+		}
+		return
+	}
+
+	// Ephemeral: mark terminal FIRST (so racing actors observe it), then destroy
+	// the instance. Proceed to teardown even if the status write fails —
+	// protecting the paid instance is the priority.
 	if err := s.store.UpdateSessionStatus(sess.ID, statusTerminated); err != nil {
 		log.Printf("ecu reaper: mark session %s terminated: %v", sess.ID, err)
 	}

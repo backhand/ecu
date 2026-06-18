@@ -117,6 +117,44 @@ func TestFakeStubs(t *testing.T) {
 	}
 }
 
+// TestFakeDeleteImage verifies DeleteImage records refs, is idempotent (repeat
+// + unknown ref return nil), and that DeleteImageErr forces a failure recording
+// nothing.
+func TestFakeDeleteImage(t *testing.T) {
+	p := New()
+	ctx := context.Background()
+
+	if p.DeletedImageCount() != 0 {
+		t.Fatalf("fresh fake should have zero deleted images")
+	}
+	if err := p.DeleteImage(ctx, "fake-image-ecu-persist-s_a"); err != nil {
+		t.Fatalf("DeleteImage: %v", err)
+	}
+	if !p.DeletedImage("fake-image-ecu-persist-s_a") {
+		t.Fatalf("DeletedImage = false, want true")
+	}
+	if p.DeletedImageCount() != 1 {
+		t.Fatalf("DeletedImageCount = %d, want 1", p.DeletedImageCount())
+	}
+	// Idempotent: repeat + unknown ref are nil (and recorded, like DeleteInstance).
+	if err := p.DeleteImage(ctx, "fake-image-ecu-persist-s_a"); err != nil {
+		t.Fatalf("repeat DeleteImage must be idempotent (nil), got %v", err)
+	}
+	if err := p.DeleteImage(ctx, "fake-image-nope"); err != nil {
+		t.Fatalf("DeleteImage(unknown) must be idempotent (nil), got %v", err)
+	}
+
+	// DeleteImageErr forces a failure and records nothing.
+	p2 := New()
+	p2.DeleteImageErr = errors.New("delete image boom")
+	if err := p2.DeleteImage(ctx, "x"); err == nil {
+		t.Fatalf("DeleteImage should fail when DeleteImageErr is set")
+	}
+	if p2.DeletedImageCount() != 0 {
+		t.Fatalf("a failed DeleteImage must record nothing; DeletedImageCount = %d", p2.DeletedImageCount())
+	}
+}
+
 // TestFakeFindImageResult verifies the FindImageResult hook is honored, so
 // startup tests can model a pre-existing snapshot.
 func TestFakeFindImageResult(t *testing.T) {

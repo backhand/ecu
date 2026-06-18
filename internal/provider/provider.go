@@ -65,8 +65,16 @@ type Provider interface {
 	// best-effort and idempotent: matching nothing returns (0, nil).
 	DeleteInstancesByLabel(ctx context.Context, key, value string) (int, error)
 
-	// CreateImage snapshots fromInstance into a named image (pre-baking, C7).
+	// CreateImage snapshots fromInstance into a named image (pre-baking, C7;
+	// also the per-session snapshot of a persistent session in C8).
 	CreateImage(ctx context.Context, fromInstance, name string) (Image, error)
+
+	// DeleteImage destroys the image/snapshot referenced by ref (C8: culling a
+	// stopped persistent session's saved state, and replacing a session's prior
+	// snapshot when a newer one is taken). Like DeleteInstance it MUST be
+	// idempotent: deleting an unknown / already-deleted image (or a ref that can
+	// never name a real image) returns nil so culling can be retried safely.
+	DeleteImage(ctx context.Context, ref string) error
 
 	// FindImage looks up an image by name. found is false (with err=nil) when no
 	// such image exists; that is not an error.

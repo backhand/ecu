@@ -34,7 +34,23 @@ const provisionPollInterval = 200 * time.Millisecond
 //     teardown does NOT fire.
 //   - If the session is DELETEd while provisioning (status terminated), the
 //     waiter stops and does NOT resurrect or override it.
+//
+// It delegates to provisionSessionFromImage with the ACTIVE boot image (the
+// pre-baked snapshot once a bake completes, else the cold-boot OS image). The
+// C8 restore path calls provisionSessionFromImage directly with a session's
+// saved snapshot ref instead.
 func (s *Server) provisionSession(sessionID, tunnelToken string) {
+	s.provisionSessionFromImage(sessionID, tunnelToken, s.ActiveBootImage())
+}
+
+// provisionSessionFromImage runs the production provisioning flow booting from
+// an EXPLICIT image ref. provisionSession passes ActiveBootImage (cold boot or
+// pre-bake snapshot); the C8 restore path passes the restored session's saved
+// snapshot ref, so the new instance boots that saved state (for Hetzner the ref
+// is the snapshot's numeric id, which CreateInstance routes through its id
+// path). All other behavior — teardown on every post-create failure, the
+// readiness wait, and the concurrent-DELETE handling — is shared.
+func (s *Server) provisionSessionFromImage(sessionID, tunnelToken, bootImage string) {
 	timeout := s.provisionCfg.ProvisionTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -59,16 +75,17 @@ func (s *Server) provisionSession(sessionID, tunnelToken string) {
 		return
 	}
 
-	// 2. Create the instance. BaseImage is read from ActiveBootImage so a session
-	// provisioned BEFORE a pre-bake completes cold-boots from the OS image and one
-	// AFTER boots from the snapshot — the single provisioning hook for C7. On a
-	// baked instance the session cloud-init's `docker run` finds the image locally
-	// and skips the pull.
+	// 2. Create the instance. BaseImage is the explicit bootImage: for a normal
+	// create it is ActiveBootImage (cold-boot OS image, or the C7 pre-bake
+	// snapshot once one exists); for a C8 restore it is the session's saved
+	// snapshot ref so the instance boots that saved state. On a baked instance
+	// the session cloud-init's `docker run` finds the image locally and skips the
+	// pull.
 	spec := provider.InstanceSpec{
 		Name:      instanceName(sessionID),
 		Type:      s.provisionCfg.InstanceType,
 		Region:    s.provisionCfg.Region,
-		BaseImage: s.ActiveBootImage(),
+		BaseImage: bootImage,
 		UserData:  userData,
 		Labels:    map[string]string{"ecu-session": sessionID},
 	}

@@ -67,6 +67,8 @@ func TestFileConfigRoundTrip(t *testing.T) {
 		MaxLifetime:           4 * time.Hour,
 		BakeTimeout:           25 * time.Minute, // C7
 		MaxPersistentSessions: 2,
+		PersistentMaxLifetime: 18 * time.Hour,     // C8
+		PersistentMaxAge:      5 * 24 * time.Hour, // C8
 		DevToolServer:         "http://127.0.0.1:8000",
 	}
 
@@ -98,6 +100,12 @@ func TestFileConfigRoundTrip(t *testing.T) {
 	}
 	if reloaded.BakeTimeout != original.BakeTimeout {
 		t.Fatalf("BakeTimeout = %v, want %v", reloaded.BakeTimeout, original.BakeTimeout)
+	}
+	if reloaded.PersistentMaxLifetime != original.PersistentMaxLifetime {
+		t.Fatalf("PersistentMaxLifetime = %v, want %v", reloaded.PersistentMaxLifetime, original.PersistentMaxLifetime)
+	}
+	if reloaded.PersistentMaxAge != original.PersistentMaxAge {
+		t.Fatalf("PersistentMaxAge = %v, want %v", reloaded.PersistentMaxAge, original.PersistentMaxAge)
 	}
 }
 

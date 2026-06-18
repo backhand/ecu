@@ -216,6 +216,29 @@ func (p *Provider) CreateImage(ctx context.Context, fromInstance, name string) (
 	return provider.Image{ID: strconv.FormatInt(res.Image.ID, 10), Name: name}, nil
 }
 
+// DeleteImage destroys the image/snapshot with the given id (C8: culling a
+// stopped persistent session's saved state, or replacing a prior per-session
+// snapshot). It mirrors DeleteInstance's idempotency: a non-numeric ref (a
+// snapshot is always referenced by numeric id, so a bad ref can never name a
+// real image) and a not_found response both return nil so culling can be
+// retried safely and never wedges. Other errors propagate.
+func (p *Provider) DeleteImage(ctx context.Context, ref string) error {
+	n, err := strconv.ParseInt(ref, 10, 64)
+	if err != nil {
+		// A bad ref can never correspond to a real snapshot; treat as nothing to
+		// delete rather than wedging the cull.
+		return nil
+	}
+	_, err = p.client.Image.Delete(ctx, &hcloudapi.Image{ID: n})
+	if err != nil {
+		if hcloudapi.IsError(err, hcloudapi.ErrorCodeNotFound) {
+			return nil // already gone — idempotent
+		}
+		return fmt.Errorf("hcloud: deleting image %s: %w", ref, err)
+	}
+	return nil
+}
+
 // FindImage looks up a pre-baked image by its ecu-image label. found is false
 // (err=nil) when no such image exists.
 func (p *Provider) FindImage(ctx context.Context, name string) (provider.Image, bool, error) {
