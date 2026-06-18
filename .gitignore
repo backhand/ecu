@@ -7,6 +7,7 @@
 
 # Go build output
 /ecu
+/bin/
 /dist/
 *.test
 *.out
