@@ -143,6 +143,14 @@ func runControlPlane() error {
 	opts := []controlplane.ServerOption{
 		controlplane.WithExposeTunnelToken(exposeTunnelToken),
 		controlplane.WithListenAddr(cfg.Listen),
+		// C9 live watch: the HMAC secret for short-lived view tokens (empty ->
+		// random key generated in NewServer, which invalidates tokens across
+		// restarts; fine for minutes-long tokens) and the public base URL used to
+		// build watch_url. The base derives the same way as the bake callback URL
+		// (https://<hostname> in production, http://<listen> in dev) — same
+		// public-reachability dependency as the tunnel/bake URLs (C10).
+		controlplane.WithSigningKey(cfg.SigningKey),
+		controlplane.WithPublicBaseURL(callbackBaseURL(cfg)),
 		// C5: the global active-session cap and the reaper apply in BOTH dev and
 		// production. In dev mode there is no provider, so reaper teardown is a
 		// no-op, but idle/lifetime reaping of dev sessions and the cap are still
@@ -229,6 +237,12 @@ func runControlPlane() error {
 	}
 	if exposeTunnelToken {
 		log.Printf("ecu: DEV tunnel-token exposure enabled (ECU_DEV_EXPOSE_TUNNEL_TOKEN=1); POST /sessions returns the tunnel secret — do NOT use in production")
+	}
+	// C9 live watch: with no ECU_SIGNING_KEY the server uses a random key, so
+	// watch tokens minted before a restart stop validating after it. Fine for
+	// minutes-long tokens; note it so operators can set a stable key if desired.
+	if cfg.SigningKey == "" {
+		log.Printf("ecu: ECU_SIGNING_KEY unset; using a random watch-token signing key (watch URLs do not survive a restart)")
 	}
 
 	// Graceful lifecycle: cancel ctx on SIGINT/SIGTERM, run the reaper and the

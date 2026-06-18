@@ -31,9 +31,11 @@ from typing import Literal
 
 import numpy as np
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel, Field
+
+from .watch import register_watch_routes
 
 # Import the *latest* concrete ComputerTool directly from the module. Note the
 # demo's tools/__init__.py only re-exports the 20241022/20250124 classes, but
@@ -58,10 +60,11 @@ DISPLAY_NUM = os.getenv("DISPLAY_NUM", "1")
 DISPLAY = f":{DISPLAY_NUM}"
 
 # noVNC lives on this port in the base image (novnc_startup.sh --listen 6080,
-# serving /opt/noVNC, so vnc.html is the client page). /watch redirects here
-# until the control plane proxies it (Component 9).
+# serving /opt/noVNC, so vnc.html is the client page, plus a /websockify
+# WebSocket bridging to the VNC server on :5900). The tool server reverse-proxies
+# it under /watch so it is reachable through the single tunnel target (:8000) --
+# see watch.py and register_watch_routes below (Component 9).
 NOVNC_PORT = int(os.getenv("ECU_NOVNC_PORT") or 6080)
-WATCH_PATH = os.getenv("ECU_WATCH_PATH", "/vnc.html")
 
 # Diff protocol (Component 6). The dirty-check is a coarse grid: we compare the
 # current frame against the base in TILE_SIZE x TILE_SIZE blocks (cheap, no
@@ -549,15 +552,10 @@ async def exec_(body: ExecBody) -> JSONResponse:
     return JSONResponse(result)
 
 
-@app.get("/watch")
-async def watch() -> RedirectResponse:
-    """Redirect to the container's noVNC client.
-
-    For now this is a 302 to the local noVNC page; the full tunneled proxy is
-    Component 9. autoconnect/resize make the embedded viewer usable directly.
-    """
-    target = (
-        f"http://localhost:{NOVNC_PORT}{WATCH_PATH}"
-        "?autoconnect=true&resize=scale"
-    )
-    return RedirectResponse(url=target, status_code=302)
+# Live watch endpoint (Component 9): reverse-proxy the container's noVNC client
+# (page + assets + the websockify WebSocket) under /watch, so a human can watch
+# the desktop through the single tunnel target. The control plane proxies its
+# token-gated /sessions/{id}/watch to this. This is a SEPARATE path from
+# /screenshot -- it shares no framing state with the perception loop. See
+# watch.py for the prefix-proxy / asset-path / websockify-bridge details.
+register_watch_routes(app, NOVNC_PORT)

@@ -342,10 +342,18 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := getSessionResponse{
-		Status:   sess.Status,
-		Width:    sess.Width,
-		Height:   sess.Height,
-		WatchURL: nil, // filled by C9
+		Status: sess.Status,
+		Width:  sess.Width,
+		Height: sess.Height,
+	}
+	// C9: mint a fresh short-lived view token and return the absolute watch_url,
+	// but only for a READY session (a watch view needs a live tunnel to proxy
+	// through). For other states, and when no public base URL is configured,
+	// watch_url stays null. Each status poll returns a fresh token (TTL ~minutes).
+	if sess.Status == statusReady {
+		if u := s.watchURLFor(id); u != "" {
+			resp.WatchURL = &u
+		}
 	}
 	if sess.Status == statusError {
 		resp.Detail = "session provisioning failed; the instance (if any) has been torn down"

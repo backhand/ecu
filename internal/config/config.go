@@ -83,6 +83,14 @@ type Config struct {
 	// store as an active admin key on startup.
 	APIKey string
 
+	// SigningKey is the secret (ECU_SIGNING_KEY) used to HMAC-sign short-lived
+	// view tokens for the live-watch endpoint (C9). It is OPTIONAL: when unset,
+	// the control plane generates a random key at startup. A random key means
+	// watch tokens (and watch cookies) minted before a restart stop validating
+	// after it — acceptable for a token whose TTL is only minutes, but set this
+	// to a stable secret if you want watch URLs to survive restarts.
+	SigningKey string
+
 	// Provider selects the cloud provider implementation (ECU_PROVIDER).
 	// Defaults to defaultProvider. Consumed by the provider component (C4).
 	Provider string
@@ -202,6 +210,7 @@ type fileConfig struct {
 	Hostname              string `json:"hostname,omitempty"`
 	Listen                string `json:"listen,omitempty"`
 	APIKey                string `json:"api_key,omitempty"`
+	SigningKey            string `json:"signing_key,omitempty"`
 	Provider              string `json:"provider,omitempty"`
 	HCloudToken           string `json:"hcloud_token,omitempty"`
 	InstanceType          string `json:"instance_type,omitempty"`
@@ -321,6 +330,7 @@ func resolve(env map[string]string, fileCfg *Config, isTTY bool, required []stri
 	c.Hostname = pick(env["ECU_HOSTNAME"], fileCfg.Hostname)
 	c.Listen = pick(env["ECU_LISTEN"], fileCfg.Listen, defaultListen)
 	c.APIKey = pick(env["ECU_API_KEY"], fileCfg.APIKey)
+	c.SigningKey = pick(env["ECU_SIGNING_KEY"], fileCfg.SigningKey)
 	c.Provider = pick(env["ECU_PROVIDER"], fileCfg.Provider, defaultProvider)
 	c.HCloudToken = pick(env["ECU_HCLOUD_TOKEN"], fileCfg.HCloudToken)
 	c.InstanceType = pick(env["ECU_INSTANCE_TYPE"], fileCfg.InstanceType)

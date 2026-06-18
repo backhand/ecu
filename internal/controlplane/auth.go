@@ -62,10 +62,13 @@ const agentConnectPath = "/agent/connect"
 // completely unchanged.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == agentConnectPath || bakeCallbackExempt(r.URL.Path) {
-			// Token-authed endpoints (tunnel ingress / bake-completion callback):
-			// API-key auth does not apply; each handler does its own constant-time
-			// per-operation token check.
+		if r.URL.Path == agentConnectPath || bakeCallbackExempt(r.URL.Path) || watchPathExempt(r.URL.Path) {
+			// Token-authed / browser-facing endpoints: API-key auth does not
+			// apply. The tunnel ingress and bake-completion callback do their own
+			// per-operation token check; the live-watch route (C9) is gated by a
+			// short-lived view token / cookie inside handleWatch. The watch path
+			// is exempted here so a human's browser (which has no API key) reaches
+			// the viewer; handleWatch rejects it without a valid token.
 			next.ServeHTTP(w, r)
 			return
 		}

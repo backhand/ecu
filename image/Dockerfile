@@ -21,10 +21,16 @@ WORKDIR /home/computeruse
 
 # Install the tool-server deps into the same pyenv Python the demo tools use.
 # Pinned for reproducibility; versions verified compatible with the image's
-# pydantic 2.x / anyio 4.x / starlette range.
+# pydantic 2.x / anyio 4.x / starlette range. httpx + websockets back the
+# /watch noVNC reverse proxy (Component 9): httpx streams the noVNC page/assets,
+# websockets bridges the websockify WebSocket. Both already ship transitively in
+# the base image, but we pin them explicitly so the tool server's runtime deps
+# are self-documenting and reproducible.
 RUN python -m pip install --no-cache-dir \
         "fastapi==0.115.6" \
-        "uvicorn[standard]==0.34.0"
+        "uvicorn[standard]==0.34.0" \
+        "httpx==0.28.1" \
+        "websockets==16.0"
 
 # Our additions. Copy with the right ownership so the unprivileged user can
 # read them.

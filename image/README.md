@@ -5,8 +5,8 @@ The disposable computer-use container for ECU. It builds on the
 computer-use tools (`ComputerTool`, `BashTool` in `computer_use_demo/tools/`) as
 a small localhost-bound HTTP API, replacing the demo's Streamlit chat UI and
 agent loop. The Xfce-style desktop (Xvfb + tint2 + mutter), X11, VNC and noVNC
-all keep running -- the tool server needs the X display, and noVNC is reused by
-the future `/watch` live view.
+all keep running -- the tool server needs the X display, and the tool server
+reverse-proxies noVNC under `/watch` for the live human-watch view (Component 9).
 
 This is **Component 1** of ECU. The control plane, tunnel agent and skill live
 elsewhere in the repo; this directory is just the image.
@@ -21,6 +21,7 @@ image/
 ├── entrypoint.sh       runs the demo desktop/VNC/noVNC startup, then launches uvicorn (not Streamlit)
 ├── toolserver/         the FastAPI app
 │   ├── app.py          endpoints; wraps the demo's ComputerTool, plain subprocess for /exec
+│   ├── watch.py        /watch reverse proxy to local noVNC (page + assets + websockify WS)
 │   ├── __main__.py     `python -m toolserver` convenience launcher
 │   └── __init__.py
 └── README.md
@@ -43,7 +44,9 @@ the image, `ComputerTool20251124`, driving `xdotool`/`scrot`). Only `/exec`
 | `POST /scroll`    | `{x,y,dx,dy}`                 | `{"ok":true}` |
 | `POST /exec`      | `{command, timeout?}`         | `{"stdout":...,"stderr":...,"code":N}` |
 | `GET  /healthz`   | --                            | `{"ok":true}` (200; 503 until the X display is up) |
-| `GET  /watch`     | --                            | 302 redirect to the local noVNC client |
+| `GET  /watch`     | --                            | 302 → `/watch/vnc.html?...` (the noVNC viewer; see "Live watch" below) |
+| `GET  /watch/...` | --                            | reverse-proxied to local noVNC on :6080 (page, JS/CSS assets) |
+| `WS   /watch/websockify` | --                     | WebSocket bridged to noVNC's websockify (→ VNC on :5900) |
 
 Notes:
 
@@ -126,8 +129,7 @@ plane's job (Component 4), not the container's.
 | `WIDTH` / `HEIGHT`    | 1280x800  | Desktop resolution (the upstream demo defaults to 1024x768). |
 | `DISPLAY_NUM`         | 1         | X display number (`DISPLAY=:1`). |
 | `ECU_TOOLSERVER_PORT` | 8000      | Port uvicorn binds inside the container. |
-| `ECU_NOVNC_PORT`      | 6080      | noVNC port that `/watch` redirects to. |
-| `ECU_WATCH_PATH`      | /vnc.html | noVNC client page for `/watch`. |
+| `ECU_NOVNC_PORT`      | 6080      | Local noVNC port the `/watch` proxy forwards to. |
 | `ECU_DIFF_TILE`       | 64        | Tile size (px) for the screenshot dirty-check grid. |
 | `ECU_DIFF_FULL_COVERAGE` | 0.9    | Changed-tile fraction at/above which `/screenshot` falls back to `full`. |
 
@@ -174,14 +176,42 @@ curl -s -XPOST localhost:8000/exec -H 'content-type: application/json' \
 curl -s -XPOST localhost:8000/screenshot -H 'content-type: application/json' -d '{}' \
   | python3 -c 'import sys,json,base64;d=json.load(sys.stdin);open("/tmp/shot2.png","wb").write(base64.b64decode(d["image"]))'
 
-# watch (302 -> noVNC; use GET, the route only allows GET)
+# watch: /watch -> 302 to the proxied noVNC viewer (use GET; the route only allows GET)
 curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' localhost:8000/watch
+# the viewer HTML, served THROUGH the proxy (expect 200 + <title>noVNC)
+curl -s -L localhost:8000/watch | head -c 120; echo
+# a noVNC asset through the proxy (expect 200)
+curl -s -o /dev/null -w 'app/ui.js -> %{http_code}\n' localhost:8000/watch/app/ui.js
+# the websockify WS upgrade through the proxy (expect 101)
+curl -s -i --max-time 2 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  localhost:8000/watch/websockify | head -1
 
 docker rm -f ecu1
 ```
 
-Watch the live desktop in a browser while testing: open
-<http://localhost:6080/vnc.html> (or just hit `http://localhost:8000/watch`).
+### Live watch (`/watch`)
+
+`/watch` serves the container's **noVNC** client so a human can watch the
+desktop. noVNC + websockify already run on :6080 (the web client plus a
+`/websockify` WebSocket bridging to the VNC server on :5900), but the ECU reverse
+tunnel only reaches the tool server on :8000 — it has no route to :6080. So the
+tool server **reverse-proxies noVNC under `/watch`** (`watch.py`):
+
+- `GET /watch` (and `/watch/`) → 302 to `/watch/vnc.html` with
+  `autoconnect`/`resize`/`path` query params so the viewer connects itself. The
+  `path` param is computed from the request path, so it is correct whether you
+  hit `/watch` directly on :8000 **or** `…/sessions/{id}/watch` through the
+  control plane.
+- `GET /watch/<rest>` → strip-prefix proxy to `:6080/<rest>`. noVNC's `vnc.html`
+  uses **relative** asset URLs (`app/...`), so entering at `/watch/vnc.html`
+  resolves every asset under `/watch/…` and the strip-prefix forward serves them.
+- `WS /watch/websockify` → bridged to noVNC's websockify on :6080.
+
+In production you don't hit this directly: the control plane gates it behind a
+short-lived view token at `GET /sessions/{id}/watch` and proxies it through the
+tunnel (Component 9). To watch the live desktop in a browser during local image
+testing, open <http://localhost:8000/watch>.
 
 ### Screenshot diff-protocol smoke test
 

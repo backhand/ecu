@@ -106,6 +106,17 @@ type Server struct {
 	// provisioning flow (reader) never race.
 	activeBootImage string
 	bootImageMu     sync.RWMutex
+
+	// signingKey is the HMAC secret for live-watch view tokens (C9). It is set in
+	// NewServer from ECU_SIGNING_KEY or a random 32 bytes (WithSigningKey). Never
+	// empty after construction.
+	signingKey []byte
+
+	// publicBaseURL is the externally reachable base (e.g. "https://ecu.example.com"
+	// or "http://127.0.0.1:8080" in dev) used to build the absolute watch_url in
+	// GET /sessions status (C9). Empty leaves watch_url null (no public base
+	// configured). Set via WithPublicBaseURL.
+	publicBaseURL string
 }
 
 // ProvisionConfig carries the settings the production provisioning path needs.
@@ -199,6 +210,25 @@ func WithMaxPersistentSessions(n int) ServerOption {
 	return func(s *Server) { s.maxPersistentSessions = n }
 }
 
+// WithSigningKey sets the HMAC secret for live-watch view tokens (C9). An empty
+// key means "generate a random one in NewServer" (tokens then don't survive a
+// restart — fine for minutes-long view tokens). main passes ECU_SIGNING_KEY.
+func WithSigningKey(key string) ServerOption {
+	return func(s *Server) {
+		if key != "" {
+			s.signingKey = []byte(key)
+		}
+	}
+}
+
+// WithPublicBaseURL sets the externally reachable base URL used to build the
+// absolute watch_url in GET /sessions status (C9), e.g.
+// "https://ecu.example.com" or "http://127.0.0.1:8080" in dev. Empty (the
+// default) leaves watch_url null.
+func WithPublicBaseURL(base string) ServerOption {
+	return func(s *Server) { s.publicBaseURL = base }
+}
+
 // WithClock overrides the clock the reaper reads (default time.Now). It exists
 // for deterministic tests, which advance a fake clock instead of sleeping. Only
 // the reaper consults this clock; the broker stamps real wall-clock time so the
@@ -227,6 +257,12 @@ func NewServer(st *store.Store, devToolServer string, opts ...ServerOption) *Ser
 	// Default the reaper clock to wall-clock time unless a test injected one.
 	if s.now == nil {
 		s.now = time.Now
+	}
+	// Default the watch-token signing key to a random 32 bytes when none was
+	// configured (WithSigningKey left it empty). A random key invalidates view
+	// tokens across restarts — acceptable for a minutes-long token.
+	if len(s.signingKey) == 0 {
+		s.signingKey, _ = resolveSigningKey("")
 	}
 	// Composite: tunnel preferred, direct dev endpoint as fallback. When
 	// devToolServer is empty the direct side simply never resolves (ok=false),
@@ -275,6 +311,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{id}/{action}", s.handleAction)
+	// C9 live watch: a human-watchable noVNC view proxied through the session's
+	// tunnel, API-key-EXEMPT and gated by a short-lived view token/cookie inside
+	// handleWatch. The bare path and the asset/websockify sub-paths are separate
+	// patterns (Go's mux needs the {rest...} catch-all to be its own route); the
+	// bare one calls handleWatch with an empty {rest}.
+	mux.HandleFunc("GET /sessions/{id}/watch", s.handleWatch)
+	mux.HandleFunc("GET /sessions/{id}/watch/{rest...}", s.handleWatch)
 	mux.HandleFunc("GET /agent/connect", s.handleAgentConnect)
 	mux.HandleFunc("POST /internal/bake/{token}/done", s.handleBakeDone)
 	return s.authMiddleware(mux)
