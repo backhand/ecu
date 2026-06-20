@@ -61,6 +61,15 @@ READY_TIMEOUT = 300           # seconds to wait for a session to become ready
 # ``_settle_request_timeout``.
 SETTLE_TIMEOUT_MARGIN = 10.0
 
+# Baked-in defaults. EMPTY in the canonical repo copy (env vars are then
+# required, as documented). When this skill is downloaded preconfigured from an
+# ECU control plane's web page, the control plane substitutes its URL and your
+# API key into the two lines below, so the skill works with no environment
+# setup. Explicit constructor args and the ECU_URL / ECU_API_KEY env vars, if
+# set, still take precedence over these.
+_BAKED_URL = ""
+_BAKED_API_KEY = ""
+
 
 class ECUError(Exception):
     """Any error talking to the ECU control plane."""
@@ -102,8 +111,8 @@ class ECUClient:
         api_key: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
     ):
-        self.base_url = (base_url or os.environ.get("ECU_URL", "")).rstrip("/")
-        self.api_key = api_key or os.environ.get("ECU_API_KEY", "")
+        self.base_url = (base_url or os.environ.get("ECU_URL", "") or _BAKED_URL).rstrip("/")
+        self.api_key = api_key or os.environ.get("ECU_API_KEY", "") or _BAKED_API_KEY
         self.timeout = timeout
         if not self.base_url:
             raise ECUError("ECU_URL is not set (control plane base URL).")

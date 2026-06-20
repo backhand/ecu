@@ -33,6 +33,8 @@ Both do the same thing. Prefer the MCP server if you can.
 
 ## Setup
 
+<!-- ECU_PRECONFIGURED -->
+
 Set two environment variables (get these from whoever runs your ECU control
 plane):
 

@@ -333,6 +333,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}/watch/{rest...}", s.handleWatch)
 	mux.HandleFunc("GET /agent/connect", s.handleAgentConnect)
 	mux.HandleFunc("POST /internal/bake/{token}/done", s.handleBakeDone)
+	// Browser-facing skill download: a public landing page at the root and an
+	// API-key-authenticated zip of the preconfigured skill (see skillzip.go).
+	// {$} matches ONLY the exact root path "/" (not every unmatched path), so the
+	// landing page does not shadow other routes. The page is auth-exempt (it just
+	// collects a key); /skill.zip stays behind the middleware so the existing key
+	// check guards it.
+	mux.HandleFunc("GET /{$}", s.handleSkillIndex)
+	mux.HandleFunc("GET /skill.zip", s.handleSkillDownload)
 	return s.authMiddleware(mux)
 }
 

@@ -161,3 +161,14 @@ traefik proxies transparently — no extra Ingress configuration needed. The
 control plane is a stateful singleton (embedded SQLite + in-memory tunnel
 registry): run **one** replica, backed by the `ecu-data` PVC. See
 [`deploy/k3s/README.md`](deploy/k3s/README.md) for details.
+
+### Getting the skill (preconfigured)
+
+Once a control plane is running, an operator or agent can grab a ready-to-use
+copy of the skill straight from the browser: **open the control-plane root URL**
+(e.g. `https://ecu.example.com/`), enter an API key, and download the
+`ecu-computer-use.zip`. The control-plane URL and that key are **baked into the
+downloaded skill** (`ecu_client.py`), so it works as-is — no manual `ECU_URL` /
+`ECU_API_KEY` setup. The download itself is authenticated by the API key (the
+page only collects it; `GET /skill.zip` validates it). Setting those env vars
+still overrides the baked-in values if you ever need to repoint the skill.
