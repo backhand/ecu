@@ -21,6 +21,7 @@
 ecu.config
 ecu.config.*
 /secrets/
+secret.yaml
 
 # Python
 __pycache__/
