@@ -1,7 +1,9 @@
 # Build context excludes for the control-plane image (Dockerfile at repo root).
-# The control-plane build needs only go.mod/go.sum and the Go source under
-# cmd/ and internal/; everything below is irrelevant to it and only bloats the
-# context (or leaks local state), so keep it out.
+# The control-plane build needs go.mod/go.sum, the Go source under cmd/ and
+# internal/, AND the skill package (skill/embed.go + the skill/ecu-computer-use
+# tree are compiled into the binary via go:embed and served at /skill.zip).
+# Everything below is irrelevant to it and only bloats the context (or leaks
+# local state), so keep it out.
 
 # VCS + editor/OS cruft.
 .git/
@@ -35,8 +37,10 @@ deploy/
 # (image/Dockerfile); not needed to build the control-plane binary.
 image/
 
-# The skill (Python) — not a control-plane build input.
-skill/
+# The skill IS a control-plane build input now (go:embed — see the header):
+# keep skill/embed.go and the skill/ecu-computer-use tree IN the context. Only
+# the Python test file is never embedded; caches are skipped by go:embed anyway.
+skill/ecu-computer-use/test_*.py
 
 # Python caches (from the skill / tool server).
 __pycache__/
@@ -46,3 +50,9 @@ venv/
 
 # Docs that are not build inputs.
 *.md
+
+# ...EXCEPT the skill docs that ARE embedded into the binary (go:embed bakes
+# SKILL.md + references/api.md into /skill.zip). Re-include them, overriding the
+# broad references/ and *.md excludes above — last match wins in .dockerignore.
+!skill/ecu-computer-use/SKILL.md
+!skill/ecu-computer-use/references/api.md
