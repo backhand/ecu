@@ -74,6 +74,11 @@ def start_session(persistent: bool = False, restore: str = "") -> str:
     Returns the session_id you pass to every other tool. Call end_session when
     you're done — always, even if the task failed.
 
+    This blocks until the desktop is ACTION-READY: it not only waits for the
+    instance to come up but also warms the screenshot + exec paths, so your very
+    first screenshot/click isn't slowed by the cold-desktop start. (Transient
+    timeouts during the wait are retried automatically.)
+
     persistent: request a session whose desktop state survives end_session.
                 This is a PRIVILEGED capability: it only works if this
                 deployment's API key is authorized for it, otherwise the request
@@ -96,7 +101,12 @@ def start_session(persistent: bool = False, restore: str = "") -> str:
 # not try to build an output JSON schema from the Image|str return annotation.
 @mcp.tool(structured_output=False)
 def screenshot(
-    session_id: str, max_width: int = 1280, force_full: bool = False
+    session_id: str,
+    max_width: int = 1280,
+    force_full: bool = False,
+    settle: bool = False,
+    settle_ms: int = 0,
+    max_wait_ms: int = 0,
 ) -> Image | str:
     """Capture the current screen and return it as an image to look at.
 
@@ -118,9 +128,30 @@ def screenshot(
     force_full: ignore the 'no change' optimization and always return a fresh
                 full image — use it when you want to re-examine the pixels even
                 though the screen hasn't changed.
+    settle:     capture-once-stable. When True, the server waits until the screen
+                has STOPPED CHANGING (a window finished painting, a page finished
+                loading) and returns that stable frame instead of a possibly
+                mid-render one. PREFER this over taking a screenshot, seeing it's
+                still loading, and manually waiting/polling — set settle=True
+                right after the action that triggers a load or a window open. It
+                never hangs: it gives up at max_wait_ms and returns the latest
+                frame.
+    settle_ms:  how long (ms) the screen must be unchanged to count as settled
+                (implies settle). 0 = use the server default (~300 ms).
+    max_wait_ms: hard cap (ms) on the total settle wait. 0 = server default
+                (~2500 ms). An endlessly-animating screen returns at this cap.
     """
     sess = _get(session_id)
-    shot = client().screenshot(sess, max_width=max_width, force_full=force_full)
+    # The MCP surface uses 0 to mean "unset" for the millisecond knobs (the wire
+    # wants None there); convert so an omitted arg is the server default.
+    shot = client().screenshot(
+        sess,
+        max_width=max_width,
+        force_full=force_full,
+        settle=settle,
+        settle_ms=(settle_ms or None),
+        max_wait_ms=(max_wait_ms or None),
+    )
     if shot.mode == "nochange":
         # Don't re-tokenize an identical frame: hand back a tiny text sentinel.
         # `force_full=True` forces a real image if the model wants pixels again.
@@ -174,14 +205,31 @@ def scroll(session_id: str, x: int, y: int, dx: int = 0, dy: int = 0) -> str:
 
 
 @mcp.tool()
-def exec_command(session_id: str, command: str) -> str:
+def exec_command(session_id: str, command: str, timeout: int = 0) -> str:
     """Run a shell command on the computer and return stdout/stderr/exit code.
 
     Prefer this over GUI clicking when a task has a clean command-line path
     (launching apps, file ops, installing packages) — it's faster and more
     reliable than driving the mouse. Use the GUI for things only the GUI can do.
+
+    The command runs as ``sh -c <command>`` (so pipes, ``&&``, loops, and
+    redirects work) as the unprivileged user ``computeruse`` in
+    ``/home/computeruse``. It is one-shot — there is no shell that persists
+    between calls. The result is returned as text: an ``exit=<code>`` line, then
+    a ``stdout:`` block and a ``stderr:`` block when non-empty.
+
+    A FOREGROUND command returns when it finishes (server run budget 120 s by
+    default; if it overruns it is killed and comes back with ``exit=124``).
+    Background a long-running GUI app with a trailing ``&`` (e.g.
+    ``firefox-esr >/dev/null 2>&1 &``) so exec returns immediately instead of
+    blocking on it.
+
+    timeout: server-side run budget in seconds for THIS command. 0 (default)
+             uses the server's 120 s default; raise it for a legitimately long
+             job (a big install, a slow build).
     """
-    res = client().exec(session_id, command)
+    # 0 -> None: let the server apply its own default budget when unset.
+    res = client().exec(session_id, command, timeout=(timeout or None))
     out = res.get("stdout", "")
     err = res.get("stderr", "")
     code = res.get("code", res.get("exit_code", "?"))

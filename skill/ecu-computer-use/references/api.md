@@ -114,7 +114,8 @@ documented after this table) make up the forwarded action surface; any other
 ```
 `timeout` (seconds, default 120) bounds the run; on timeout `code` is `124` and
 the timeout note is appended to `stderr`. `exec` is a one-shot `sh -c` (no
-persistent shell session); background long-running things yourself
+persistent shell session), and runs as the unprivileged user `computeruse` in
+`/home/computeruse`; background long-running things yourself
 (`... >/dev/null 2>&1 &`).
 
 A tool-level failure (e.g. the X display isn't up) comes back as the tool

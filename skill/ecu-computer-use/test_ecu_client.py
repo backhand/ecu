@@ -752,11 +752,14 @@ class _FakeClient:
         self.action_calls = []     # (name, args, kwargs)
 
     def screenshot(self, sess, max_width=1280, force_full=False,
-                   format="jpeg", quality=75):
+                   format="jpeg", quality=75,
+                   settle=False, settle_ms=None, max_wait_ms=None):
         shot = self.shots.pop(0)
         # Mirror the real client: stamp the session scale so _get() reflects it.
         sess.screenshot_scale = shot.scale
         self._last = (max_width, force_full)
+        # Record the settle args the MCP tool forwarded, for assertions.
+        self._last_settle = (settle, settle_ms, max_wait_ms)
         return shot
 
     def click(self, session_id, x, y, button="left", scale=1.0):
@@ -989,6 +992,368 @@ def _screenshot_action_probe(self, session_id):
 
 
 SerializationClient.screenshot_action_probe = _screenshot_action_probe  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------
+# Transient-error retry + per-call timeouts + warm-up.
+#
+# These mock LOWER than ScriptedClient: they replace the client's underlying
+# ``requests.Session.request`` (``client._session.request``) so the real
+# ``_request`` -> ``_do_request`` retry loop runs. ``time.sleep`` is patched out
+# so the backoff never actually waits.
+# --------------------------------------------------------------------------
+
+import requests  # noqa: E402  (imported here, next to the tests that use it)
+from unittest import mock  # noqa: E402
+
+
+class _FakeResp:
+    """Minimal stand-in for a ``requests.Response`` carrying just what
+    ``_do_request`` inspects: ``status_code``, ``ok``, ``content``, ``json()``.
+    A JSON body is encoded so ``.content`` is truthy and ``.json()`` returns it.
+    """
+
+    def __init__(self, status_code=200, body=None):
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 400
+        self._body = {} if body is None else body
+        # `content` only needs to be truthy for _do_request to call json().
+        self.content = json.dumps(self._body).encode() if self._body else b""
+        self.text = json.dumps(self._body)
+
+    def json(self):
+        return self._body
+
+
+def _full_frame_body():
+    """A canned full-frame screenshot response (a real tiny PNG)."""
+    png = _png(8, 8, (1, 2, 3))
+    return {
+        "mode": "full", "frame_token": 1, "width": 8, "height": 8,
+        "native_width": 8, "native_height": 8, "image": _b64(png),
+    }
+
+
+class _SessionRequestStub:
+    """Callable that scripts a sequence for ``requests.Session.request``.
+
+    Each scripted item is either an Exception instance (raised) or a ``_FakeResp``
+    (returned). It records every call's (method, url, timeout, json) so tests can
+    assert how many attempts ran and what timeout/body reached the wire.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = []  # list of {method, url, timeout, json}
+
+    def __call__(self, method, url, timeout=None, **kwargs):
+        self.calls.append(
+            {"method": method, "url": url, "timeout": timeout,
+             "json": kwargs.get("json")}
+        )
+        if not self._script:
+            # Default to a benign full frame so a test that under-scripts the
+            # number of attempts fails on the assertion, not with IndexError.
+            return _FakeResp(200, _full_frame_body())
+        item = self._script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _patch_session(client, script):
+    """Install a scripted stub onto the client's requests.Session and return it.
+
+    Patching ``client._session.request`` (the real ``requests.Session`` used by
+    ``_do_request``) means the genuine ``_request`` -> ``_do_request`` retry loop
+    is exercised — only the actual socket call is faked.
+    """
+    stub = _SessionRequestStub(script)
+    client._session.request = stub  # type: ignore[method-assign]
+    return stub
+
+
+class RetrySafeOpsTest(unittest.TestCase):
+    """Safe/idempotent ops (status, screenshot, end) retry on transient failures;
+    unsafe ops (exec/_action, start) do not. time.sleep is patched out."""
+
+    def test_status_retries_then_succeeds_after_timeout(self):
+        """get_status survives a ReadTimeout (then a ConnectionError) and returns
+        the status; the underlying request is called once per attempt."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("boom"),
+            requests.exceptions.ConnectionError("nope"),
+            _FakeResp(200, {"status": "ready", "width": 1280, "height": 800}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep") as slept:
+            st = client.get_status("s1")
+        self.assertEqual(st["status"], "ready")
+        # 3 total attempts (2 transient failures + 1 success).
+        self.assertEqual(len(stub.calls), 3)
+        # Slept between attempts (backoff), but never really waited.
+        self.assertEqual(slept.call_count, 2)
+
+    def test_status_retries_on_503_then_succeeds(self):
+        """A 503 response is treated as transient and retried; the next 200 wins."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            _FakeResp(503, {"detail": "warming"}),
+            _FakeResp(200, {"status": "ready"}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            st = client.get_status("s1")
+        self.assertEqual(st["status"], "ready")
+        self.assertEqual(len(stub.calls), 2)
+
+    def test_screenshot_retries_on_transient_then_succeeds(self):
+        """screenshot (a safe read) rides out a transient timeout and still
+        reconstructs the frame."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("slow first frame"),
+            _FakeResp(200, _full_frame_body()),
+        ])
+        sess = Session(session_id="s1", status="ready")
+        with mock.patch.object(ecu_client.time, "sleep"):
+            shot = client.screenshot(sess, max_width=None)
+        self.assertEqual(shot.mode, "full")
+        self.assertEqual(len(stub.calls), 2)
+
+    def test_end_session_retries_on_transient(self):
+        """end_session (idempotent teardown) retries so a dropped DELETE response
+        doesn't leak the instance."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            requests.exceptions.ConnectionError("dropped"),
+            _FakeResp(200, {"status": "terminated"}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            res = client.end_session("s1")
+        self.assertEqual(res["status"], "terminated")
+        self.assertEqual(len(stub.calls), 2)
+
+    def test_exec_does_not_retry_on_transient(self):
+        """exec has side effects, so a transient failure raises after a SINGLE
+        attempt — no retry (re-running could double-execute the command)."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("boom"),
+            # A success is scripted but must NEVER be reached (no retry).
+            _FakeResp(200, {"stdout": "", "stderr": "", "code": 0}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep") as slept:
+            with self.assertRaises(ecu_client.ECUError):
+                client.exec("s1", "echo hi")
+        # Exactly one attempt; never slept (no backoff because no retry).
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(slept.call_count, 0)
+
+    def test_action_does_not_retry_on_503(self):
+        """A 503 on an action (click) is NOT retried either — it raises at once."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            _FakeResp(503, {"detail": "warming"}),
+            _FakeResp(200, {"ok": True}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            with self.assertRaises(ecu_client.ECUError):
+                client.click("s1", 1, 2)
+        self.assertEqual(len(stub.calls), 1)
+
+    def test_start_session_does_not_retry(self):
+        """start_session provisions a paid instance, so a transient failure on
+        create raises immediately (a retry could orphan a duplicate)."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("boom"),
+            _FakeResp(200, {"session_id": "s_new", "status": "ready"}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            with self.assertRaises(ecu_client.ECUError):
+                client.start_session(wait=False)
+        self.assertEqual(len(stub.calls), 1)
+
+    def test_retry_exhaustion_raises(self):
+        """When every attempt fails transiently, the retryable op still raises
+        ECUError after exactly self.retries attempts."""
+        client = _make_client()  # default retries == RETRY_ATTEMPTS (3)
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("1"),
+            requests.exceptions.ReadTimeout("2"),
+            requests.exceptions.ReadTimeout("3"),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep") as slept:
+            with self.assertRaises(ecu_client.ECUError):
+                client.get_status("s1")
+        self.assertEqual(len(stub.calls), ecu_client.RETRY_ATTEMPTS)  # 3 tries
+        # Slept between tries but not after the last failure.
+        self.assertEqual(slept.call_count, ecu_client.RETRY_ATTEMPTS - 1)
+
+    def test_retries_override_is_honored(self):
+        """ECUClient(retries=1) means 'no retry' even for a safe op."""
+        client = ECUClient(base_url="https://ecu.test", api_key="k_test", retries=1)
+        stub = _patch_session(client, [
+            requests.exceptions.ReadTimeout("boom"),
+            _FakeResp(200, {"status": "ready"}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            with self.assertRaises(ecu_client.ECUError):
+                client.get_status("s1")
+        self.assertEqual(len(stub.calls), 1)
+
+    def test_non_transient_5xx_is_not_retried(self):
+        """A 500 (not 503) is not transient — it raises on the first response,
+        with no retry, even for a safe op."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            _FakeResp(500, {"detail": "boom"}),
+            _FakeResp(200, {"status": "ready"}),
+        ])
+        with mock.patch.object(ecu_client.time, "sleep"):
+            with self.assertRaises(ecu_client.ECUError):
+                client.get_status("s1")
+        self.assertEqual(len(stub.calls), 1)
+
+
+class ExecTimeoutTest(unittest.TestCase):
+    """exec sends the server `timeout` only when given, and always uses a client
+    HTTP timeout >= the server's 120 s budget."""
+
+    def test_exec_client_timeout_covers_server_budget_by_default(self):
+        """With no timeout arg, exec sends NO server `timeout` field and uses a
+        client HTTP timeout >= 120 (so a slow-but-fine exec isn't cut off)."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            _FakeResp(200, {"stdout": "", "stderr": "", "code": 0}),
+        ])
+        client.exec("s1", "sleep 1")
+        call = stub.calls[-1]
+        self.assertGreaterEqual(call["timeout"], 120)
+        self.assertEqual(call["timeout"], ecu_client.EXEC_TIMEOUT)  # 150 floor
+        # No server-side timeout sent -> server uses its own 120 s default.
+        self.assertNotIn("timeout", call["json"])
+
+    def test_exec_with_explicit_timeout_sends_it_and_widens_client_budget(self):
+        """A big explicit timeout is sent as the server `timeout` AND widens the
+        client HTTP timeout to outlast it (timeout + 30 here, > the 150 floor)."""
+        client = _make_client()
+        stub = _patch_session(client, [
+            _FakeResp(200, {"stdout": "", "stderr": "", "code": 124}),
+        ])
+        client.exec("s1", "long job", timeout=300)
+        call = stub.calls[-1]
+        self.assertEqual(call["json"]["timeout"], 300)        # server budget sent
+        self.assertEqual(call["timeout"], 330)                # max(150, 300+30)
+
+
+class ScreenshotHeavyTimeoutTest(unittest.TestCase):
+    """png / full-res screenshots auto-raise the per-call HTTP timeout; a normal
+    downscaled jpeg keeps the default."""
+
+    def test_png_screenshot_raises_timeout(self):
+        client = _make_client()
+        stub = _patch_session(client, [_FakeResp(200, _full_frame_body())])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=640, format="png")
+        self.assertEqual(
+            stub.calls[-1]["timeout"], float(ecu_client.SCREENSHOT_HEAVY_TIMEOUT)
+        )
+
+    def test_full_res_screenshot_raises_timeout(self):
+        client = _make_client()
+        stub = _patch_session(client, [_FakeResp(200, _full_frame_body())])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=None)  # native res -> heavy
+        self.assertEqual(
+            stub.calls[-1]["timeout"], float(ecu_client.SCREENSHOT_HEAVY_TIMEOUT)
+        )
+
+    def test_normal_jpeg_keeps_default_timeout(self):
+        """A downscaled jpeg (the common case) gets no override (None -> default
+        client timeout reaches the requests call)."""
+        client = _make_client()
+        stub = _patch_session(client, [_FakeResp(200, _full_frame_body())])
+        sess = Session(session_id="s1", status="ready")
+        client.screenshot(sess, max_width=640, format="jpeg")
+        # No per-request override: the client default (DEFAULT_TIMEOUT) is used.
+        self.assertEqual(stub.calls[-1]["timeout"], client.timeout)
+        self.assertEqual(client.timeout, ecu_client.DEFAULT_TIMEOUT)
+
+
+class WarmUpTest(unittest.TestCase):
+    """wait_until_ready warms the screenshot + exec paths on ready (warm=True),
+    issues no probes when warm=False, and never lets a probe failure break
+    readiness."""
+
+    def _ready_status_client(self):
+        """A client whose get_status reports `ready` immediately, with a spy
+        recording the warm-up probe paths. Uses a ScriptedClient subclass so
+        get_status is satisfied without real HTTP, while _request is spied."""
+
+        class WarmSpyClient(ScriptedClient):
+            def __init__(self):
+                # One scripted response: the ready status for wait_until_ready.
+                super().__init__([{"status": "ready", "width": 1280, "height": 800}])
+                self.warm_paths = []
+
+            def _request(self, method, path, **kwargs):  # type: ignore[override]
+                # Record warm-up probe paths (screenshot/exec POSTs), then either
+                # answer them with a canned response or fall through to the
+                # scripted get_status for the status GET.
+                if path.endswith("/screenshot") and method == "POST":
+                    self.warm_paths.append("screenshot")
+                    return _full_frame_body()
+                if path.endswith("/exec") and method == "POST":
+                    self.warm_paths.append("exec")
+                    return {"stdout": "", "stderr": "", "code": 0}
+                return super()._request(method, path, **kwargs)
+
+        return WarmSpyClient()
+
+    def test_warm_true_issues_two_probes_after_ready(self):
+        client = self._ready_status_client()
+        sess = Session(session_id="s1", status="provisioning")
+        client.wait_until_ready(sess, warm=True)
+        self.assertEqual(sess.status, "ready")
+        # Exactly the two warm-up probes, in order: screenshot then exec.
+        self.assertEqual(client.warm_paths, ["screenshot", "exec"])
+
+    def test_warm_false_issues_no_probes(self):
+        client = self._ready_status_client()
+        sess = Session(session_id="s1", status="provisioning")
+        client.wait_until_ready(sess, warm=False)
+        self.assertEqual(sess.status, "ready")
+        self.assertEqual(client.warm_paths, [])
+
+    def test_warmup_does_not_touch_session_base(self):
+        """The warm-up probes must not populate the Session's screenshot base/
+        token (they use raw _request, not screenshot()), so the caller's first
+        real screenshot still behaves as a clean first frame."""
+        client = self._ready_status_client()
+        sess = Session(session_id="s1", status="provisioning")
+        client.wait_until_ready(sess, warm=True)
+        self.assertIsNone(sess._base_png)
+        self.assertIsNone(sess._base_token)
+
+    def test_warmup_failure_is_swallowed(self):
+        """A warm-up probe that raises must NOT fail readiness — wait_until_ready
+        still returns ready."""
+
+        class RaisingWarmClient(ScriptedClient):
+            def __init__(self):
+                super().__init__([{"status": "ready", "width": 1280, "height": 800}])
+
+            def _request(self, method, path, **kwargs):  # type: ignore[override]
+                if path.endswith(("/screenshot", "/exec")) and method == "POST":
+                    raise ecu_client.ECUError("warm-up blew up")
+                return super()._request(method, path, **kwargs)
+
+        client = RaisingWarmClient()
+        sess = Session(session_id="s1", status="provisioning")
+        # Must not raise despite both warm-up probes failing.
+        client.wait_until_ready(sess, warm=True)
+        self.assertEqual(sess.status, "ready")
 
 
 if __name__ == "__main__":

@@ -61,6 +61,27 @@ READY_TIMEOUT = 300           # seconds to wait for a session to become ready
 # ``_settle_request_timeout``.
 SETTLE_TIMEOUT_MARGIN = 10.0
 
+# ---- transient-error retry --------------------------------------------------
+# Retry only applies to SAFE/idempotent calls (status / screenshot / end — see
+# the retry= callers). A retry of a session CREATE could orphan a duplicate paid
+# instance, and a retry of an action/exec could double-apply a side effect, so
+# those never retry (a transient failure there raises immediately, as before).
+RETRY_ATTEMPTS = 3            # total tries for a retryable call (1 try + 2 retries)
+RETRY_BACKOFF_BASE = 0.5      # seconds; exponential 0.5, 1.0, 2.0, … capped below
+RETRY_BACKOFF_CAP = 5.0       # seconds; never sleep longer than this between tries
+
+# ---- per-call timeouts for slow/cold operations -----------------------------
+# The server allows exec up to 120 s (api.md); the old 30 s client default would
+# trip first. Use a client budget that always clears the server's: max(this,
+# server_budget + margin). 124 is the exec exit code on server-side timeout.
+EXEC_TIMEOUT = 150            # seconds; client HTTP budget floor for exec
+# Full-res and PNG (lossless) frames are large and slow to encode + transfer;
+# raise this single call's timeout so a heavy frame doesn't trip the default.
+SCREENSHOT_HEAVY_TIMEOUT = 120
+# Best-effort warm-up probes (issued once on ready) absorb the cold desktop's
+# first-call latency; they get their own generous budget and never fail readiness.
+WARMUP_TIMEOUT = 120
+
 # Baked-in defaults. EMPTY in the canonical repo copy (env vars are then
 # required, as documented). When this skill is downloaded preconfigured from an
 # ECU control plane's web page, the control plane substitutes its URL and your
@@ -110,10 +131,14 @@ class ECUClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
+        retries: Optional[int] = None,
     ):
         self.base_url = (base_url or os.environ.get("ECU_URL", "") or _BAKED_URL).rstrip("/")
         self.api_key = api_key or os.environ.get("ECU_API_KEY", "") or _BAKED_API_KEY
         self.timeout = timeout
+        # Total attempts for retryable (safe/idempotent) calls. `None` -> the
+        # module default; an explicit value (incl. 1, meaning "no retry") wins.
+        self.retries = RETRY_ATTEMPTS if retries is None else retries
         if not self.base_url:
             raise ECUError("ECU_URL is not set (control plane base URL).")
         if not self.api_key:
@@ -175,7 +200,12 @@ class ECUClient:
     # ---- low-level HTTP ---------------------------------------------------
 
     def _request(
-        self, method: str, path: str, timeout: float | None = None, **kwargs
+        self,
+        method: str,
+        path: str,
+        timeout: float | None = None,
+        retry: bool = False,
+        **kwargs,
     ) -> dict:
         # Serialize per session: the lock is keyed off the {id} in the path so
         # two concurrent calls to the same session can't overlap on the wire,
@@ -189,22 +219,65 @@ class ECUClient:
         # which can exceed the default 30 s); ``None`` keeps the default. Passing
         # it as an explicit kwarg (not inside ``**kwargs``) keeps it out of the
         # ``requests`` call kwargs except where we put it.
+        #
+        # ``retry`` (default False) opts THIS call into transient-error retry. It
+        # is set ONLY by safe/idempotent callers (status / screenshot / end); see
+        # ``_do_request`` for what counts as transient. False keeps today's exact
+        # single-attempt behavior, so action/exec/create are unchanged.
         with self._serialize(self._session_id_from_path(path)):
-            return self._do_request(method, path, timeout=timeout, **kwargs)
+            return self._do_request(
+                method, path, timeout=timeout, retry=retry, **kwargs
+            )
 
     def _do_request(
-        self, method: str, path: str, timeout: float | None = None, **kwargs
+        self,
+        method: str,
+        path: str,
+        timeout: float | None = None,
+        retry: bool = False,
+        **kwargs,
     ) -> dict:
         url = f"{self.base_url}{path}"
         # A per-request override wins; otherwise the client default. This keeps
         # non-settle calls on the default timeout untouched.
         eff_timeout = self.timeout if timeout is None else timeout
-        try:
-            resp = self._session.request(
-                method, url, timeout=eff_timeout, **kwargs
-            )
-        except requests.RequestException as e:
-            raise ECUError(f"network error calling {method} {path}: {e}") from e
+        # One try when retry is off; otherwise up to self.retries total tries.
+        # ``attempt`` is 0-based so the backoff is 0.5 * 2**attempt (0.5, 1, 2…).
+        max_attempts = self.retries if retry else 1
+        attempt = 0
+        while True:
+            try:
+                resp = self._session.request(
+                    method, url, timeout=eff_timeout, **kwargs
+                )
+            except requests.RequestException as e:
+                # Only timeouts and connection errors are transient + safe to
+                # re-issue (the request may never have reached/affected the
+                # server, or the response was merely lost). Other Request
+                # exceptions (malformed URL, SSL, too-many-redirects, …) are not
+                # transient — raise immediately, exactly as before. Because retry
+                # is opt-in (safe ops only), re-issuing is harmless here.
+                if retry and isinstance(
+                    e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+                ) and attempt + 1 < max_attempts:
+                    self._sleep_backoff(attempt)
+                    attempt += 1
+                    continue
+                raise ECUError(f"network error calling {method} {path}: {e}") from e
+            # 503 (service unavailable) is the one status worth retrying: the
+            # tool server is briefly warming/unreachable and a backed-off retry
+            # often succeeds. We do NOT retry other 4xx/5xx or 429 — a 429 means
+            # "back off and stop creating load", and other errors won't fix
+            # themselves on a blind retry — those fall through and raise below.
+            if (
+                retry
+                and resp.status_code == 503
+                and attempt + 1 < max_attempts
+            ):
+                self._sleep_backoff(attempt)
+                attempt += 1
+                continue
+            break
         if resp.status_code == 401:
             raise ECUError("unauthorized — check ECU_API_KEY")
         if resp.status_code == 429:
@@ -224,6 +297,17 @@ class ECUClient:
                 return {"raw": resp.text}
         return {}
 
+    @staticmethod
+    def _sleep_backoff(attempt: int) -> None:
+        """Sleep before re-issuing a retryable request.
+
+        Exponential backoff keyed on the 0-based ``attempt`` (so the wait before
+        the 2nd try is ``RETRY_BACKOFF_BASE``, before the 3rd is double that, …),
+        capped at ``RETRY_BACKOFF_CAP`` so it never blocks an interactive loop for
+        long. Factored out so tests can patch ``time.sleep`` and not really wait.
+        """
+        time.sleep(min(RETRY_BACKOFF_BASE * (2 ** attempt), RETRY_BACKOFF_CAP))
+
     # ---- session lifecycle ----------------------------------------------
 
     def start_session(
@@ -231,6 +315,7 @@ class ECUClient:
         persistent: bool = False,
         restore: Optional[str] = None,
         wait: bool = True,
+        warm: bool = True,
     ) -> Session:
         """Provision a computer. Returns a Session.
 
@@ -238,6 +323,15 @@ class ECUClient:
                     API key must be authorized for it, else this is rejected).
         restore:    a prior persistent session_id to restore desktop state from.
         wait:       poll until the session is ready (default True).
+        warm:       when waiting, also warm the action path on ready so that
+                    ``ready`` means action-ready (default True; see
+                    ``wait_until_ready``). Skipped entirely when ``wait`` is
+                    False — a non-waiting caller didn't ask us to block.
+
+        Note: this CREATE is deliberately NOT retried on a transient failure —
+        starting a session provisions a paid cloud instance, and a blind re-issue
+        after a lost response could orphan a duplicate. A failed start raises; the
+        caller decides whether to try again.
         """
         body = {"persistent": persistent}
         if restore:
@@ -251,10 +345,20 @@ class ECUClient:
             height=int(data.get("height", 0)),
         )
         if wait:
-            self.wait_until_ready(sess)
+            self.wait_until_ready(sess, warm=warm)
         return sess
 
-    def wait_until_ready(self, sess: Session, timeout: int = READY_TIMEOUT) -> Session:
+    def wait_until_ready(
+        self, sess: Session, timeout: int = READY_TIMEOUT, warm: bool = True
+    ) -> Session:
+        """Poll until the session is ``ready`` (or ``error``/timeout).
+
+        When the session reaches ``ready`` and ``warm`` is True, this also runs a
+        best-effort warm-up of the screenshot + exec paths BEFORE returning (see
+        ``_warm_up``), so by the time this returns ``ready`` genuinely means
+        "action-ready" rather than "the desktop is still warming". Pass
+        ``warm=False`` to skip that (e.g. a fast non-blocking poll).
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             status = self.get_status(sess.session_id)
@@ -262,6 +366,12 @@ class ECUClient:
             if sess.status == "ready":
                 sess.width = int(status.get("width", sess.width))
                 sess.height = int(status.get("height", sess.height))
+                # Absorb the cold desktop's first-call latency now, so the very
+                # first screenshot/exec the caller issues is fast. Best-effort:
+                # _warm_up never raises (a warm-up failure must not fail a session
+                # that is otherwise ready).
+                if warm:
+                    self._warm_up(sess.session_id)
                 return sess
             if sess.status == "error":
                 raise ECUError(
@@ -274,13 +384,66 @@ class ECUClient:
             f"(last status: {sess.status})"
         )
 
+    def _warm_up(self, session_id: str) -> None:
+        """Best-effort warm-up of the screenshot + exec paths on a just-ready
+        session, so the caller's first real action doesn't eat the cold start.
+
+        A freshly-``ready`` cloud desktop is often still warming (X up, but the
+        first screencap / first ``sh -c`` are slow as caches fill), which is why
+        a documented "start -> screenshot" used to blow past the 30 s default on
+        step one. We pre-pay that cost here by issuing two tiny throwaway probes:
+        a 2px screenshot and an ``exec`` of ``true``. Each gets the generous
+        WARMUP_TIMEOUT budget and ``retry=True`` so a transient blip while warming
+        doesn't matter.
+
+        Two deliberate choices:
+          * We use the RAW ``_request`` (not ``self.screenshot`` / ``self.exec``)
+            so the probe NEVER mutates the Session's screenshot base/token/scale
+            cache — the caller's first real ``screenshot()`` must still behave as
+            a clean first frame.
+          * EACH probe is wrapped so ANY exception is swallowed. Warm-up is a pure
+            latency optimization; it must never turn an otherwise-ready session
+            into a failure. (It is also skipped entirely when the caller passes
+            ``wait=False`` / ``--no-wait`` and never calls ``wait_until_ready``.)
+        """
+        # (a) tiny screenshot probe — warms the capture/encode pipeline.
+        try:
+            self._request(
+                "POST",
+                f"/sessions/{session_id}/screenshot",
+                json={"mode": "full", "format": "jpeg", "quality": 50, "max_width": 2},
+                timeout=WARMUP_TIMEOUT,
+                retry=True,
+            )
+        except Exception:
+            pass
+        # (b) trivial exec probe — warms the sh -c / tool-server exec path.
+        try:
+            self._request(
+                "POST",
+                f"/sessions/{session_id}/exec",
+                json={"command": "true"},
+                timeout=WARMUP_TIMEOUT,
+                retry=True,
+            )
+        except Exception:
+            pass
+
     def get_status(self, session_id: str) -> dict:
-        return self._request("GET", f"/sessions/{session_id}")
+        # retry=True: a GET status read is idempotent — re-issuing it on a
+        # transient timeout/503 can only ever return the status again, never
+        # change anything. This is also what makes wait_until_ready() ride out a
+        # brief network blip instead of failing the whole provision.
+        return self._request("GET", f"/sessions/{session_id}", retry=True)
 
     def end_session(self, session_id: str) -> dict:
         """Tear down. Ephemeral sessions are destroyed; persistent sessions are
         snapshotted and stopped. Always call this when finished, even on error."""
-        return self._request("DELETE", f"/sessions/{session_id}")
+        # retry=True: teardown is idempotent (a second DELETE of an already-
+        # terminated/stopped session is a no-op per api.md), and we very much
+        # want a transient blip not to leak a paid instance — so a dropped DELETE
+        # response is worth re-issuing.
+        return self._request("DELETE", f"/sessions/{session_id}", retry=True)
 
     # ---- actions ---------------------------------------------------------
     #
@@ -313,8 +476,37 @@ class ECUClient:
         x, y = _scale_xy(x, y, scale)
         return self._action(session_id, "scroll", {"x": x, "y": y, "dx": dx, "dy": dy})
 
-    def exec(self, session_id, command):
-        return self._action(session_id, "exec", {"command": command})
+    def exec(self, session_id, command, timeout: Optional[int] = None):
+        """Run ``sh -c <command>`` on the desktop and return its result.
+
+        The command runs as the unprivileged user ``computeruse`` in
+        ``/home/computeruse`` (the image WORKDIR). It is one-shot — there is no
+        persistent shell between calls — but ``sh -c`` means pipes, ``&&``,
+        loops, and redirects all work in a single command string. Returns
+        ``{"stdout", "stderr", "code"}``.
+
+        timeout: the SERVER-side budget in seconds. Omitted (``None``) -> the
+                 server's own default of 120 s; a foreground command that runs
+                 past the budget is killed and comes back with ``code`` 124 (the
+                 timeout note appended to ``stderr``). Background a long-running
+                 GUI app with a trailing ``&`` so exec returns immediately.
+
+        This is NOT retried on a transient failure: exec has side effects, so a
+        blind re-issue could double-execute the command. We instead give the
+        client HTTP timeout enough headroom to outlast the server's budget —
+        ``max(EXEC_TIMEOUT, (timeout or 120) + 30)`` — so a slow-but-fine exec is
+        never cut off by the client's default 30 s timeout.
+        """
+        body: dict = {"command": command}
+        # Send the server-side timeout ONLY when the caller set one, so the
+        # server applies its own 120 s default otherwise (don't pin it here).
+        if timeout is not None:
+            body["timeout"] = timeout
+        # Client HTTP budget must comfortably clear the server's run budget (plus
+        # the round-trip), else the client would give up while the command is
+        # still legitimately running. 120 is the server default when unset.
+        req_timeout = max(EXEC_TIMEOUT, (timeout or 120) + 30)
+        return self._action(session_id, "exec", body, timeout=req_timeout)
 
     # Anchor fields scaled (shown-space -> native) for batch actions, by action.
     # Only the pointer ANCHOR is a coordinate; scroll dx/dy are scroll clicks and
@@ -439,11 +631,24 @@ class ECUClient:
             )
         return {"results": results, "screenshot": shot}
 
-    def _action(self, session_id: str, name: str, body: dict) -> dict:
+    def _action(
+        self, session_id: str, name: str, body: dict, timeout: Optional[float] = None
+    ) -> dict:
         """Low-level action POST. Sends `body` verbatim — no coordinate scaling.
         The scale-aware translation lives in click/move/scroll above; this raw
-        path is kept intact for callers that already have native coordinates."""
-        return self._request("POST", f"/sessions/{session_id}/{name}", json=body)
+        path is kept intact for callers that already have native coordinates.
+
+        ``retry`` is intentionally left at its default (False): every action has
+        a SIDE EFFECT (a click lands, a key is pressed, an exec runs), so a blind
+        re-issue after a lost response could double-apply it (two clicks, a
+        command run twice). Actions therefore raise immediately on a transient
+        failure — the caller is better placed to decide whether re-doing the
+        action is safe than the transport is. ``timeout`` is an optional
+        per-request HTTP budget (exec uses it to outlast the server's run
+        budget); ``None`` keeps the client default."""
+        return self._request(
+            "POST", f"/sessions/{session_id}/{name}", json=body, timeout=timeout
+        )
 
     # ---- screenshots (diff-aware) ---------------------------------------
 
@@ -501,6 +706,12 @@ class ECUClient:
                    larger than the default HTTP timeout is requested, the
                    per-request timeout is bumped to `max_wait_ms/1000 + margin`
                    so the client waits long enough for the server to respond.
+
+        Heavy frames: a `png` (lossless) or full-res (`max_width=None`) frame is
+        large and slow to encode + transfer, so this call's HTTP timeout is
+        raised to at least SCREENSHOT_HEAVY_TIMEOUT automatically — a heavy frame
+        won't trip the default 30 s. (The settle bump still applies; we take the
+        larger of the two.) A normal downscaled JPEG keeps the default timeout.
         """
         body: dict = {
             "mode": "full" if force_full else "auto",
@@ -528,11 +739,25 @@ class ECUClient:
         req_timeout = _settle_request_timeout(
             settle, settle_ms, max_wait_ms, self.timeout
         )
+        # Heavy frames (lossless png or full-res) are big + slow; ensure this
+        # call gets at least SCREENSHOT_HEAVY_TIMEOUT, keeping whichever of the
+        # settle bump / default is already larger. A normal downscaled jpeg is
+        # unaffected (req_timeout stays None -> default).
+        if format == "png" or max_width is None:
+            req_timeout = max(
+                req_timeout if req_timeout is not None else self.timeout,
+                SCREENSHOT_HEAVY_TIMEOUT,
+            )
+        # retry=True: a screenshot is a pure read with no side effect — re-issuing
+        # it after a transient timeout/503 just re-captures, never double-acts. It
+        # is the call most likely to hit the cold-desktop first-frame latency, so
+        # the retry matters most here.
         data = self._request(
             "POST",
             f"/sessions/{sess.session_id}/screenshot",
             json=body,
             timeout=req_timeout,
+            retry=True,
         )
         return self._screenshot_from_response(
             sess, data, max_width=max_width, format=format, quality=quality
