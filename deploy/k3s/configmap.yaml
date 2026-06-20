@@ -1,0 +1,32 @@
+# Non-secret control-plane configuration, mounted into the pod via `envFrom`
+# (see deployment.yaml). Secret-valued env (API key, Hetzner token, signing key)
+# lives in the ecu-secrets Secret instead — see secret.yaml.
+#
+# The per-deployment values (ECU_HOSTNAME, ECU_INSTANCE_TYPE, ECU_REGION) are NOT
+# edited in this file: they are set ONCE in kustomization.yaml's `ecu-settings`
+# block and stamped in here (and, for the hostname, the Ingress too) by the
+# replacements defined there, keeping a single source of truth. The values below
+# are just defaults the replacements overwrite.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecu
+  labels:
+    app: ecu-controlplane
+data:
+  # TLS is terminated by the Ingress (traefik/cert-manager), so the pod serves
+  # PLAIN HTTP — no autocert, no privileged :443/:80 bind in-cluster.
+  ECU_TLS: "off"
+  # Bind all interfaces so the Service/Ingress can reach the pod (the app default
+  # 127.0.0.1 would only be reachable from inside the pod).
+  ECU_LISTEN: "0.0.0.0:8080"
+  # SQLite DB on the persistent volume mounted at /data.
+  ECU_DB: "/data/ecu.db"
+  # Public hostname used to build tunnel/watch/callback URLs. Must match the
+  # Ingress host. Set via kustomization.yaml (see note above), not here.
+  ECU_HOSTNAME: "ecu.example.com"
+  # Hetzner server type + location to provision session VMs in. Valid type×region
+  # combos vary by stock — query the Hetzner API (/v1/datacenters) if a provision
+  # fails with "unsupported location". Set via kustomization.yaml, not here.
+  ECU_INSTANCE_TYPE: "cpx32"
+  ECU_REGION: "nbg1"

@@ -1,39 +1,57 @@
 # ECU control plane on k3s
 
 Manifests to run the ECU control plane in a k3s (or any standard Kubernetes)
-cluster. TLS is terminated by the **Ingress** (traefik, the k3s default), so the
-pod itself runs `ECU_TLS=off` and serves plain HTTP — no privileged ports
-in-cluster.
+cluster, wired together with **Kustomize**. TLS is terminated by the **Ingress**
+(traefik, the k3s default), so the pod itself runs `ECU_TLS=off` and serves
+plain HTTP — no privileged ports in-cluster.
+
+Everything you customize per-deployment lives in **`kustomization.yaml`**: the
+namespace, the control-plane image + tag, and the `ecu-settings` block — the
+public hostname plus the Hetzner instance type/region for session VMs. Those are
+set once there and stamped into the ConfigMap (and, for the hostname, the
+Ingress) by replacements, so the copies can't drift apart.
 
 ## Files
 
-| File              | What it is                                                    |
-| ----------------- | ------------------------------------------------------------- |
-| `secret.yaml`     | `ecu-secrets` — API key, Hetzner token, watch signing key. **Template; do not commit real values.** |
-| `deployment.yaml` | `ecu-controlplane` Deployment (1 replica) + `ecu-data` PVC.    |
-| `service.yaml`    | `ecu-controlplane` ClusterIP Service (port 80 → pod 8080).    |
-| `ingress.yaml`    | `ecu-controlplane` Ingress; terminates TLS, routes `/` to the Service. |
+| File                 | What it is                                                    |
+| -------------------- | ------------------------------------------------------------- |
+| `kustomization.yaml` | Ties it together; holds the customizable knobs (namespace, image tag, **hostname**, **instance type/region**). |
+| `namespace.yaml`     | The `ecu` Namespace everything is placed in.                  |
+| `configmap.yaml`     | `ecu` ConfigMap — non-secret env (`ECU_TLS`, `ECU_LISTEN`, `ECU_DB`, `ECU_HOSTNAME`, `ECU_INSTANCE_TYPE`, `ECU_REGION`). |
+| `secret.yaml`        | `ecu-secrets` — API key, Hetzner token, watch signing key. **Gitignored; copy from `secret.yaml.example`.** |
+| `deployment.yaml`    | `ecu-controlplane` Deployment (1 replica) + `ecu-data` PVC; env via `envFrom`. |
+| `service.yaml`       | `ecu-controlplane` ClusterIP Service (port 80 → pod 8080).    |
+| `ingress.yaml`       | `ecu-controlplane` Ingress; terminates TLS, routes `/` to the Service. |
 
 ## Apply
 
-1. **Create the secret** (do NOT `kubectl apply` the template with real values):
+Run these from this directory (`deploy/k3s/`).
+
+1. **Fill in the secret.** `secret.yaml` is gitignored (it holds real values);
+   copy the committed template and edit it:
 
    ```sh
-   kubectl create secret generic ecu-secrets \
-     --from-literal=ECU_API_KEY="$(openssl rand -hex 32)" \
-     --from-literal=ECU_HCLOUD_TOKEN="<hetzner-cloud-api-token>" \
-     --from-literal=ECU_SIGNING_KEY="$(openssl rand -hex 32)"
+   cp secret.yaml.example secret.yaml
+   # edit secret.yaml — strong values:
+   #   ECU_API_KEY / ECU_SIGNING_KEY  ->  openssl rand -hex 32
+   #   ECU_HCLOUD_TOKEN               ->  your Hetzner Cloud API token
    ```
 
-2. **Set your hostname.** Replace `ecu.example.com` in `deployment.yaml`
-   (`ECU_HOSTNAME`) and `ingress.yaml` (the `tls` host and the rule `host`) with
-   your real DNS name.
+   (Prefer to keep secrets out of files entirely? Drop `secret.yaml` from
+   `kustomization.yaml`'s `resources:` and `kubectl create secret generic
+   ecu-secrets --from-literal=...` out-of-band instead.)
 
-3. **Apply the rest:**
+2. **Set your deployment settings — one place.** In the `ecu-settings` block of
+   `kustomization.yaml`, set `ECU_HOSTNAME` and the Hetzner `ECU_INSTANCE_TYPE` /
+   `ECU_REGION` for session VMs. Kustomize stamps them into the ConfigMap (and
+   the hostname into the Ingress TLS host + routing rule) for you. While you're
+   there, optionally pin the image tag (`images:`) and change the namespace.
+
+3. **Render / apply:**
 
    ```sh
-   kubectl apply -f deployment.yaml -f service.yaml -f ingress.yaml
-   # or: kubectl apply -f .   (after creating the secret out-of-band)
+   kubectl kustomize .     # preview the rendered manifests
+   kubectl apply -k .      # create the namespace + everything in it
    ```
 
 4. **Point DNS** — create an A record for your host at the Ingress's external

@@ -1,0 +1,94 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Kustomization for the ECU control plane.
+#
+# Render/apply with kustomize (built into kubectl):
+#   kubectl kustomize deploy/k3s     # render to stdout
+#   kubectl apply -k deploy/k3s      # render + apply
+#
+# ░░ EVERYTHING YOU CUSTOMIZE PER-DEPLOYMENT LIVES IN THIS FILE ░░
+# The knobs are the namespace, the control-plane image+tag, and the `ecu-settings`
+# block (hostname + Hetzner instance type/region) — set once below and propagated
+# into the ConfigMap (and, for the hostname, the Ingress) by the replacements.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# KNOB 1 — namespace every resource is placed into (and namespace.yaml creates).
+namespace: ecu
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+# KNOB 2 — control-plane image + tag. The base manifests reference the image by
+# name only; pin the tag you want to ship here (e.g. a released v0.2.0).
+images:
+  - name: ghcr.io/backhand/ecu-controlplane
+    newTag: latest
+
+# KNOB 3 — deployment settings. Set these ONCE here; the replacements below stamp
+# them into the `ecu` ConfigMap (and, for the hostname, the Ingress TLS host +
+# routing rule too), so the copies never drift apart.
+#   - ECU_HOSTNAME       public hostname (must match the Ingress cert SAN).
+#   - ECU_INSTANCE_TYPE  Hetzner server type for session VMs (e.g. cpx32).
+#   - ECU_REGION         Hetzner location for session VMs (e.g. nbg1).
+#
+# This generator only CARRIES the values: the local-config annotation keeps it
+# out of the rendered output (it is never applied to the cluster), and the hash
+# suffix is disabled so the replacements can reference it by a stable name.
+configMapGenerator:
+  - name: ecu-settings
+    literals:
+      - ECU_HOSTNAME=ecu.backhand.dk
+      - ECU_INSTANCE_TYPE=cx33
+      - ECU_REGION=hel1
+    options:
+      disableNameSuffixHash: true
+      annotations:
+        config.kubernetes.io/local-config: "true"
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: ecu-settings
+      fieldPath: data.ECU_HOSTNAME
+    targets:
+      # -> the env the control plane reads at runtime.
+      - select:
+          kind: ConfigMap
+          name: ecu
+        fieldPaths:
+          - data.ECU_HOSTNAME
+      # -> the cert SAN and the routing rule. Both must equal ECU_HOSTNAME.
+      - select:
+          kind: Ingress
+          name: ecu-controlplane
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+  # Instance type + region have a single consumer (the ConfigMap), so each just
+  # overwrites its matching key there.
+  - source:
+      kind: ConfigMap
+      name: ecu-settings
+      fieldPath: data.ECU_INSTANCE_TYPE
+    targets:
+      - select:
+          kind: ConfigMap
+          name: ecu
+        fieldPaths:
+          - data.ECU_INSTANCE_TYPE
+  - source:
+      kind: ConfigMap
+      name: ecu-settings
+      fieldPath: data.ECU_REGION
+    targets:
+      - select:
+          kind: ConfigMap
+          name: ecu
+        fieldPaths:
+          - data.ECU_REGION

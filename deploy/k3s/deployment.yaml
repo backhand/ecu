@@ -42,27 +42,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          env:
-            # TLS is terminated by the Ingress (traefik/cert-manager), so the pod
-            # itself serves PLAIN HTTP — no autocert, no privileged :443/:80 bind
-            # in-cluster. (The autocert path, ECU_TLS=auto, is for the standalone
-            # binary, not this deployment.)
-            - name: ECU_TLS
-              value: "off"
-            # Bind all interfaces so the Service/Ingress can reach the pod (the
-            # app default 127.0.0.1 would only be reachable from inside the pod).
-            - name: ECU_LISTEN
-              value: "0.0.0.0:8080"
-            # SQLite DB on the persistent volume mounted at /data.
-            - name: ECU_DB
-              value: "/data/ecu.db"
-            # Public hostname used to build tunnel/watch/callback URLs. Must match
-            # the Ingress host (see ingress.yaml). Replace with your real host.
-            - name: ECU_HOSTNAME
-              value: "ecu.example.com"
-          # Secret-sourced env: the admin key, the Hetzner token, and the watch
-          # signing key all come from the ecu-secrets Secret (see secret.yaml).
+          # All env comes from two sources, both injected wholesale via envFrom:
+          #   - the `ecu` ConfigMap: non-secret config (TLS/listen/DB, hostname,
+          #     instance type/region) — see configmap.yaml.
+          #   - the `ecu-secrets` Secret: the admin key, the Hetzner token, and
+          #     the watch signing key — see secret.yaml.
           envFrom:
+            - configMapRef:
+                name: ecu
             - secretRef:
                 name: ecu-secrets
           # There is no UNAUTHENTICATED health endpoint (every API route requires

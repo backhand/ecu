@@ -138,20 +138,18 @@ Notes and limits:
 The control-plane image is `ghcr.io/backhand/ecu-controlplane`. In a cluster,
 **the Ingress terminates TLS** (traefik is the k3s default, optionally with
 cert-manager), so the Deployment runs `ECU_TLS=off` and serves plain HTTP — no
-privileged ports in the pod. Manifests live in [`deploy/k3s/`](deploy/k3s/).
+privileged ports in the pod. The manifests in [`deploy/k3s/`](deploy/k3s/) are
+wired together with Kustomize — per-deployment knobs (namespace, image tag,
+hostname, Hetzner instance type/region) all live in `kustomization.yaml`.
 
 ```sh
-# 1. Create the secret (do NOT commit real values):
-kubectl create secret generic ecu-secrets \
-  --from-literal=ECU_API_KEY="$(openssl rand -hex 32)" \
-  --from-literal=ECU_HCLOUD_TOKEN="<hetzner-cloud-api-token>" \
-  --from-literal=ECU_SIGNING_KEY="$(openssl rand -hex 32)"
+# 1. Provide the secret (gitignored; copy the template and fill it in):
+cp deploy/k3s/secret.yaml.example deploy/k3s/secret.yaml
+#    ECU_API_KEY / ECU_SIGNING_KEY -> openssl rand -hex 32; ECU_HCLOUD_TOKEN -> Hetzner token
 
-# 2. Set your hostname in deployment.yaml (ECU_HOSTNAME) and ingress.yaml,
-#    then apply the manifests:
-kubectl apply -f deploy/k3s/deployment.yaml \
-              -f deploy/k3s/service.yaml \
-              -f deploy/k3s/ingress.yaml
+# 2. Set ECU_HOSTNAME once in deploy/k3s/kustomization.yaml (it is stamped into
+#    the ConfigMap and the Ingress for you), then render + apply:
+kubectl apply -k deploy/k3s
 
 # 3. Point a DNS A record at the Ingress's external address.
 ```

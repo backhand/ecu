@@ -27,11 +27,11 @@ metadata:
   labels:
     app: ecu-controlplane
   annotations:
-    # (a) cert-manager — uncomment to have cert-manager fill the ecu-tls Secret:
-    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # (a) cert-manager — fills the ecu-tls Secret (requires a letsencrypt-prod
+    #     ClusterIssuer). Comment this out if you use path (b) instead.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
     # (b) traefik built-in ACME — uncomment if using traefik's own resolver:
     # traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
-    {}
 spec:
   tls:
     # Replace the host with your real DNS name (must match ECU_HOSTNAME in the

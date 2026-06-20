@@ -1,0 +1,9 @@
+# Namespace all ECU resources live in. The `namespace: ecu` field in
+# kustomization.yaml places every namespaced resource here; this object creates
+# the namespace itself.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecu
+  labels:
+    app: ecu-controlplane
